@@ -1,0 +1,21 @@
+name: PluginLampa 0.6.2 beta verification
+on:
+  push:
+    paths:
+      - 'PluginLampa-beta.js'
+      - 'tests/beta-*.test.cjs'
+      - '.github/workflows/beta-smoke.yml'
+  workflow_dispatch:
+jobs:
+  beta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check PluginLampa-beta.js
+      - run: node tests/beta-smoke.test.cjs
+      - run: node tests/beta-stremio.test.cjs
+      - run: node tests/beta-stremio-no-url.test.cjs
+      - run: node tests/beta-kb-integration.test.cjs
