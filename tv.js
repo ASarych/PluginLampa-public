@@ -749,14 +749,29 @@ SOFTWARE.
   }
 
   function openCard(card) {
+    card = card || {};
     var movie = movieInfo(card);
     if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id) {
       openResults(movie); return;
     }
-    L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
-      card.imdb_id = id || '';
-      openResults(movieInfo(card));
-    });
+    if (typeof L.Api.sources.tmdb.external_imdb_id !== 'function') {
+      openResults(movie); return;
+    }
+    var completed = false;
+    var timer = setTimeout(function () {
+      if (!completed) { completed = true; openResults(movie); }
+    }, 6000);
+    try {
+      L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timer);
+        card.imdb_id = id || '';
+        openResults(movieInfo(card));
+      });
+    } catch (err) {
+      if (!completed) { completed = true; clearTimeout(timer); openResults(movie); }
+    }
   }
 
   function safeInit() {
@@ -1024,6 +1039,11 @@ SOFTWARE.
       id: addon.providerId, name: 'Stremio · ' + addon.manifest.name,
       siteUrl: addon.url, persistStreams: false, timeoutMs: 12000,
       supports: function (movie) { return !!idFor(addon, movie); },
+      unavailableReason: function (movie) {
+        if (movie.media_type === 'tv' && !episode(movie)) return 'нужно открыть конкретную серию';
+        if (!movie.imdb_id && !movie.tmdb_id) return 'в карточке нет IMDb/TMDB ID';
+        return 'расширение не поддерживает этот формат ID или тип видео';
+      },
       search: function (movie) {
         var key = idFor(addon, movie);
         if (!key) return Promise.resolve([]);
@@ -1095,7 +1115,7 @@ SOFTWARE.
       function (value) {
         if (!value) return;
         install(value).then(function (item) {
-          engine.clearCache(); notify('Добавлено: ' + item.name);
+          notify('Добавлено: ' + item.name);
           manage();
         }).catch(function (err) { notify('Ошибка расширения: ' + err.message, true); });
       });
@@ -1115,7 +1135,7 @@ SOFTWARE.
       L.Select.show({title: 'Официальный список Stremio', items: choices,
         onSelect: function (choice) {
           install(choice.url).then(function (item) {
-            engine.clearCache(); notify('Добавлено: ' + item.name); manage();
+            notify('Добавлено: ' + item.name); manage();
           }).catch(function (err) { notify('Не удалось добавить: ' + err.message, true); });
         }, onBack: manage});
     }).catch(function () { notify('Не удалось загрузить список. Можно добавить ссылку вручную.', true); manage(); });
