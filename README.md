@@ -1,3 +1,9 @@
+> ⚠️ **Исправление после ошибки 404 (18 октября 2026):** если Lampa показывает красный восклицательный знак или `404` при загрузке версии 0.5, удалите из списка плагинов старую jsDelivr-ссылку. Для проверки установите отдельную облегчённую сборку 0.5.1:
+>
+> `https://raw.githubusercontent.com/ASarych/PluginLampa-public/main/PluginLampa-lite.js`
+>
+> Поддерживаются Internet Archive и Rutube. Stremio временно исключён для диагностики. **Нужно удалить старую запись плагина**, иначе Lampa всё равно будет запрашивать сломанный адрес. Если direct raw не принимается вашим клиентом, включите GitHub Pages (Settings → Pages → Deploy from a branch → main → /root) и используйте `https://asarych.github.io/PluginLampa-public/PluginLampa-lite.js` после успешной публикации. Не вводите ссылку на GitHub `blob`: она ведёт на HTML, а не на JS.
+
 # PluginLampa — видеоисточники для Lampa
 
 Публичная установочная сборка PluginLampa **v0.5.0**. Один JavaScript-файл, никаких дополнительных загрузок из приватного репозитория.
