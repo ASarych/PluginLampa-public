@@ -1,3 +1,21 @@
+# Текущая версия: PluginLampa 0.6.1 (18 октября 2026)
+
+**Ссылка для Lampa (включая Samsung Tizen / Media Station X):**
+
+```text
+https://asarych.github.io/PluginLampa-public/tv.js
+```
+
+`PluginLampa-tizen.js` — второй адрес той же актуальной сборки; их **не нужно устанавливать одновременно**.
+
+В версии 0.6.1 **все источники опрашиваются по умолчанию**, включая Rutube, Internet Archive и добавленные Stremio-расширения. Для совпадений только по названию добавлена пометка. Пункт **«Диагностика источников»** показывает, был ли запрос, почему источник пропущен, вернул ли пустой ответ или торренты вместо прямых HTTP(S)-видео. Добавление нового расширения Stremio больше не удаляет кэш других источников.
+
+**Ограничения:** многие Stremio-аддоны предоставляют только торренты (`infoHash`), для которых одного клиента Lampa на Tizen недостаточно; они не появятся как прямые видеопотоки. Возможны CORS и другие сетевые ограничения.
+
+Если плагин уже установлен по `tv.js`, достаточно перезапустить Lampa после публикации; ссылки на старые файлы `PluginLampa.js` и `PluginLampa-lite.js` лучше убрать, чтобы исключить конфликт нескольких версий.
+
+---
+
 > **Samsung Tizen / Media Station X — диагностика ошибки 404 (18 октября 2026).** В версии Lampa 3.x проверка расширений запрашивает файл и ищет текст `Lampa.`. Новые диагностический файл и Tizen-сборка включают этот маркер и используют стандартный `Lampa.Manifest.plugins`.
 >
 > Для стабильного URL рекомендуется **GitHub Pages**: в [Settings → Pages](https://github.com/ASarych/PluginLampa-public/settings/pages) выбрать `Deploy from a branch`, ветку `main`, папку `/(root)`, сохранить настройки и дождаться надписи `Your site is live at …`.
@@ -16,7 +34,7 @@
 
 # PluginLampa — видеоисточники для Lampa
 
-Публичная установочная сборка PluginLampa **v0.5.0**. Один JavaScript-файл, никаких дополнительных загрузок из приватного репозитория.
+Публичная установочная сборка PluginLampa **v0.6.1**. Один JavaScript-файл, никаких дополнительных загрузок из приватного репозитория.
 
 ## Установка в Lampa
 
@@ -24,7 +42,7 @@
 2. Вставьте адрес плагина:
    
    ```text
-   https://cdn.jsdelivr.net/gh/ASarych/PluginLampa-public@main/PluginLampa.js
+   https://asarych.github.io/PluginLampa-public/tv.js
    ```
 3. Подтвердите установку, при необходимости перезапустите Lampa.
 4. Откройте карточку фильма и вызовите контекстное меню → **«Найти видео (Video Finder)»**.
@@ -32,7 +50,7 @@
 **Альтернативный прямой адрес** (если CDN не доступен):
 
 ```text
-https://raw.githubusercontent.com/ASarych/PluginLampa-public/main/PluginLampa.js
+https://raw.githubusercontent.com/ASarych/PluginLampa-public/main/tv.js
 ```
 
 ## Возможности
