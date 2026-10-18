@@ -4,6 +4,7 @@ on:
     paths:
       - 'PluginLampa-tizen.js'
       - 'tests/tizen-smoke.test.cjs'
+      - 'tests/stremio-regression.test.cjs'
       - '.github/workflows/tizen-smoke.yml'
   workflow_dispatch:
 jobs:
@@ -16,3 +17,4 @@ jobs:
           node-version: '20'
       - run: node --check PluginLampa-tizen.js
       - run: node tests/tizen-smoke.test.cjs
+      - run: node tests/stremio-regression.test.cjs
