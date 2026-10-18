@@ -1,3 +1,13 @@
+> **Samsung Tizen / Media Station X — диагностика ошибки 404 (18 октября 2026).** В версии Lampa 3.x проверка расширений запрашивает файл и ищет текст `Lampa.`. Новые диагностический файл и Tizen-сборка включают этот маркер и используют стандартный `Lampa.Manifest.plugins`.
+>
+> Для стабильного URL рекомендуется **GitHub Pages**: в [Settings → Pages](https://github.com/ASarych/PluginLampa-public/settings/pages) выбрать `Deploy from a branch`, ветку `main`, папку `/(root)`, сохранить настройки и дождаться надписи `Your site is live at …`.
+>
+> 1. Удалить из Lampa старые ссылки на `PluginLampa.js` и `PluginLampa-lite.js` (и перезапустить, если потребуется).
+> 2. Сначала установить **диагностический** файл: `https://asarych.github.io/PluginLampa-public/PluginLampa-check.js`. Если статус 200 и появляется `PluginLampa CHECK`, загрузка JS работает. Затем диагностический плагин удалить.
+> 3. Установить **рабочую Tizen-сборку**: `https://asarych.github.io/PluginLampa-public/PluginLampa-tizen.js`. В ней два адаптера: Internet Archive и Rutube. Без Stremio. Если Pages ещё не включён, оба URL будут недоступны.
+>
+> У Lampa запросы к внешнему API могут по-прежнему блокироваться CORS, даже если сам JS успешно установлен. Видеовоспроизведение на Tizen ещё не подтверждено.
+
 > ⚠️ **Исправление после ошибки 404 (18 октября 2026):** если Lampa показывает красный восклицательный знак или `404` при загрузке версии 0.5, удалите из списка плагинов старую jsDelivr-ссылку. Для проверки установите отдельную облегчённую сборку 0.5.1:
 >
 > `https://raw.githubusercontent.com/ASarych/PluginLampa-public/main/PluginLampa-lite.js`
