@@ -612,7 +612,8 @@ SOFTWARE.
         return queryProvider(provider, movie).then(function (result) {
           diagnostics.push({provider: provider, status: result.error ?
             'Ошибка: ' + result.error : result.items.length ?
-            'найдено: ' + result.items.length : 'ответ без подходящих прямых видео'});
+            'найдено: ' + result.items.length : (provider.emptyReason ?
+              provider.emptyReason() : 'ответ без подходящих прямых видео')});
           return result;
         });
       }));
@@ -1031,14 +1032,34 @@ SOFTWARE.
     if (!stream || !stream.url || (stream.behaviorHints && stream.behaviorHints.proxyHeaders)) return '';
     return validHttp(stream.url, false);
   }
-  function playableStreams(data) {
-    return data && Array.isArray(data.streams) ? data.streams.filter(playable) : [];
+  function playableStreams(data, addon) {
+    var received = data && Array.isArray(data.streams) ? data.streams : [];
+    var direct = received.filter(playable);
+    if (addon) {
+      addon.lastResponse = {
+        received: received.length,
+        direct: direct.length,
+        torrents: received.filter(function (s) { return s && s.infoHash; }).length,
+        external: received.filter(function (s) { return s && (s.externalUrl || s.ytId); }).length,
+        proxyHeaders: received.filter(function (s) { return s && s.behaviorHints && s.behaviorHints.proxyHeaders; }).length
+      };
+    }
+    return direct;
   }
   function makeProvider(addon) {
     return {
       id: addon.providerId, name: 'Stremio · ' + addon.manifest.name,
       siteUrl: addon.url, persistStreams: false, timeoutMs: 12000,
       supports: function (movie) { return !!idFor(addon, movie); },
+      emptyReason: function () {
+        var stats = addon.lastResponse;
+        if (!stats) return 'в ответе нет воспроизводимых прямых потоков';
+        if (!stats.received) return 'сервер расширения ответил: 0 потоков';
+        if (!stats.direct) return stats.received + ' потоков: ' + stats.torrents +
+          ' торрент, ' + stats.external + ' внешних ссылок, ' + stats.proxyHeaders +
+          ' с заголовками; прямых HTTP(S): 0';
+        return 'прямые потоки обнаружены';
+      },
       unavailableReason: function (movie) {
         if (movie.media_type === 'tv' && !episode(movie)) return 'нужно открыть конкретную серию';
         if (!movie.imdb_id && !movie.tmdb_id) return 'в карточке нет IMDb/TMDB ID';
@@ -1048,7 +1069,7 @@ SOFTWARE.
         var key = idFor(addon, movie);
         if (!key) return Promise.resolve([]);
         return request(endpoint(addon, key)).then(function (data) {
-          return playableStreams(data).slice(0, 25).map(function (stream, index) {
+          return playableStreams(data, addon).slice(0, 25).map(function (stream, index) {
             var title = short(stream.name || stream.description || stream.title || 'Видео');
             return {
               id: key.type + ':' + key.id + ':' + index,
@@ -1065,7 +1086,7 @@ SOFTWARE.
           return Promise.reject(Error('Неправильная сохранённая запись'));
         }
         return request(endpoint(addon, { type: item.mediaType, id: item.videoId })).then(function (data) {
-          var streams = playableStreams(data);
+          var streams = playableStreams(data, addon);
           var matches = streams.filter(function (stream) { return JSON.stringify([stream.name || '', stream.title || '', stream.description || '']) === item.signature; });
           var selected = matches.length === 1 ? matches[0] : null;
           if (!selected) return [];
