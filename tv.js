@@ -1,0 +1,809 @@
+/*
+MIT License
+
+Copyright (c) 2026 ASarych
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// PluginLampa Tizen v0.5.2 — Archive + Rutube; narrow compatibility build.
+// PluginLampa v0.5.0 · Archive + Rutube + Stremio integration.
+/*
+ * Lampa Video Finder — extensible search plugin (prototype)
+ * Built-in example adapter: Internet Archive (public catalog search).
+ * Version 0.5.0. Persistent results, provider health, retry cooldowns.
+ * No credentials, proxies, telemetry or DRM bypass.
+ * Requires Lampa with Manifest/Select/Player API and browser fetch.
+ */
+(function () {
+  'use strict';
+
+  if (window.__lampa_video_finder_v1) return;
+  var L = window.Lampa;
+  if (!L || !L.Manifest || !L.Listener || !L.Storage || !L.Noty || !L.Select || !L.Player) {
+    console.warn('[PluginLampa] Lampa is not ready; no plugin hooks installed');
+    return;
+  }
+  window.__lampa_video_finder_v1 = true;
+  var providers = [];
+  var actions = [];
+  var busy = false;
+  var CACHE_KEY = 'video_finder_cache_v2';
+  var MAX_MOVIES = 120;
+  var MAX_RESULTS = 25;
+  var MAX_SITES = 150;
+  var MISS_TTL_MS = 30 * 60 * 1000;
+  var COOLDOWNS_MS = [0, 0, 60 * 1000, 5 * 60 * 1000, 30 * 60 * 1000];
+  var cache = loadCache();
+
+  function notify(message, error) {
+    L.Noty.show(message, error ? { style: 'error', time: 6000 } : { time: 3500 });
+  }
+
+  function movieInfo(card) {
+    card = card || {};
+    var title = card.title || card.name || card.original_title || card.original_name || '';
+    var original = card.original_title || card.original_name || title;
+    var release = card.release_date || card.first_air_date || '';
+    var year = /^\d{4}/.test(release) ? release.slice(0, 4) : (card.year || '');
+    return {
+      title: String(title),
+      original_title: String(original),
+      year: String(year),
+      imdb_id: String(card.imdb_id || ''),
+      tmdb_id: card.id || null,
+      media_type: card.media_type || (card.first_air_date || card.number_of_seasons ? 'tv' : 'movie'),
+      card: card
+    };
+  }
+
+  // Prefer Lampa's request wrapper on TV/WebView; browser hosts can use fetch.
+  function httpJson(url) {
+    if (L && typeof L.Reguest === 'function') {
+      return new Promise(function (resolve, reject) {
+        try {
+          var request = new L.Reguest();
+          request.timeout(12000);
+          request.silent(url, function (payload) {
+            try { resolve(typeof payload === 'string' ? JSON.parse(payload) : payload); }
+            catch (err) { reject(err); }
+          }, function (xhr, reason) {
+            reject(new Error('Сетевая ошибка Lampa: ' +
+              (xhr && xhr.status != null ? xhr.status : String(reason || 'unknown'))));
+          });
+        } catch (err) { reject(err); }
+      });
+    }
+    if (typeof fetch !== 'function') {
+      return Promise.reject(new Error('Нет доступного сетевого API'));
+    }
+    return fetch(url, { method: 'GET' }).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    });
+  }
+
+  function normalize(value) {
+    return String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\u0400-\u04ff]+/g, ' ')
+      .replace(/^\s+|\s+$/g, '');
+  }
+
+  function rankMatch(title, movie) {
+    var a = normalize(title);
+    var b = normalize(movie.original_title);
+    var c = normalize(movie.title);
+    if (!a) return 0;
+    if (a === b || a === c) return 100;
+    if ((b && a.indexOf(b) !== -1) || (c && a.indexOf(c) !== -1)) return 60;
+    return 5;
+  }
+
+  function searchArchiveTitle(title, movie) {
+    // Query public Archive catalog. Its metadata can contain unrelated or
+    // incomplete entries, so results are candidates, not verified matches.
+    var escaped = String(title).replace(/[\\"\r\n]/g, ' ').trim();
+    if (!escaped) return Promise.resolve([]);
+    var query = 'mediatype:movies AND title:"' + escaped + '"';
+    var url = 'https://archive.org/advancedsearch.php?output=json&rows=15' +
+      '&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=year' +
+      '&q=' + encodeURIComponent(query);
+    return httpJson(url).then(function (payload) {
+      var documents = payload && payload.response && payload.response.docs;
+      if (!Array.isArray(documents)) return [];
+      return documents.filter(function (document) {
+        if (!document || !document.identifier || !document.title) return false;
+        if (movie.year && document.year && String(movie.year) !== String(document.year)) return false;
+        return rankMatch(document.title, movie) >= 60;
+      }).map(function (document) {
+        return {
+          id: String(document.identifier),
+          sourceUrl: 'https://archive.org/details/' + encodeURIComponent(document.identifier),
+          title: String(document.title),
+          subtitle: (document.year ? String(document.year) + ' · ' : '') + 'Internet Archive',
+          confidence: rankMatch(document.title, movie)
+        };
+      });
+    });
+  }
+
+  function searchArchive(movie) {
+    var names = [movie.original_title];
+    if (normalize(movie.title) !== normalize(movie.original_title)) names.push(movie.title);
+    return Promise.all(names.map(function (name) {
+      // Keep partial results, but if every request fails don't erase cached hits.
+      return searchArchiveTitle(name, movie).then(function (items) {
+        return { ok: true, items: items };
+      }).catch(function (err) {
+        console.warn('[VideoFinder] Archive search request failed', err);
+        return { ok: false, items: [] };
+      });
+    })).then(function (groups) {
+      if (!groups.some(function (group) { return group.ok; })) {
+        throw new Error('All Archive search requests failed');
+      }
+      var seen = Object.create(null);
+      var found = [];
+      groups.forEach(function (group) {
+        group.items.forEach(function (item) {
+          if (seen[item.id]) return;
+          seen[item.id] = true;
+          found.push(item);
+        });
+      });
+      return found.sort(function (a, b) { return b.confidence - a.confidence; });
+    });
+  }
+
+  function resolveArchive(item) {
+    var url = 'https://archive.org/metadata/' + encodeURIComponent(item.id);
+    return httpJson(url).then(function (payload) {
+      var files = (payload && payload.files) || [];
+      return files.filter(function (file) {
+        return file && file.name && /\.mp4$/i.test(file.name) &&
+          file.private !== 'true' && file.private !== true;
+      }).map(function (file) {
+        return {
+          title: String(file.name),
+          subtitle: (file.size ? Math.round(Number(file.size) / 1048576) + ' MB' : 'MP4'),
+          url: 'https://archive.org/download/' + encodeURIComponent(item.id) + '/' +
+            String(file.name).split('/').map(encodeURIComponent).join('/')
+        };
+      });
+    });
+  }
+
+  // Store candidates, not the rendered Lampa UI objects (those contain functions).
+  // Cache entries are local to the device and survive application restarts.
+  function loadCache() {
+    var empty = { version: 2, movies: {}, sites: {}, health: {} };
+    try {
+      if (!L.Storage || typeof L.Storage.get !== 'function') return empty;
+      var raw = L.Storage.get(CACHE_KEY, '');
+      if (!raw) return empty;
+      var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || parsed.version !== 2 || !parsed.movies || !parsed.sites ||
+          typeof parsed.movies !== 'object' || typeof parsed.sites !== 'object') return empty;
+      // Backward-compatible extension of v0.2 data. Do not delete saved films.
+      if (!parsed.health || typeof parsed.health !== 'object' || Array.isArray(parsed.health)) parsed.health = {};
+      return parsed;
+    } catch (err) {
+      console.warn('[VideoFinder] Cache could not be loaded', err);
+      return empty;
+    }
+  }
+
+  function saveCache() {
+    try {
+      var movieKeys = Object.keys(cache.movies);
+      if (movieKeys.length > MAX_MOVIES) {
+        movieKeys.sort(function (a, b) {
+          return (cache.movies[a].updated || 0) - (cache.movies[b].updated || 0);
+        });
+        movieKeys.slice(0, movieKeys.length - MAX_MOVIES).forEach(function (key) {
+          delete cache.movies[key];
+        });
+      }
+      var sites = Object.keys(cache.sites);
+      if (sites.length > MAX_SITES) {
+        sites.sort(function (a, b) {
+          return (cache.sites[a].lastSeen || 0) - (cache.sites[b].lastSeen || 0);
+        });
+        sites.slice(0, sites.length - MAX_SITES).forEach(function (key) {
+          delete cache.sites[key];
+        });
+      }
+      if (L.Storage && typeof L.Storage.set === 'function') {
+        L.Storage.set(CACHE_KEY, JSON.stringify(cache));
+      }
+    } catch (err) {
+      console.warn('[VideoFinder] Cannot save search cache', err);
+    }
+  }
+
+  function providerHealth(provider) {
+    var id = provider.id;
+    if (!Object.prototype.hasOwnProperty.call(cache.health, id)) {
+      cache.health[id] = { successes: 0, empty: 0, failures: 0, streak: 0, cooldownUntil: 0, lastOk: 0, lastFail: 0 };
+    }
+    return cache.health[id];
+  }
+
+  function providerAvailable(provider, forced) {
+    return forced || providerHealth(provider).cooldownUntil <= Date.now();
+  }
+
+  function recordProviderSuccess(provider, itemsCount) {
+    var stats = providerHealth(provider);
+    if (itemsCount > 0) stats.successes += 1;
+    else stats.empty += 1;
+    stats.streak = 0;
+    stats.cooldownUntil = 0;
+    stats.lastOk = Date.now();
+    saveCache();
+  }
+
+  function recordProviderFailure(provider) {
+    var stats = providerHealth(provider);
+    stats.failures += 1;
+    stats.streak += 1;
+    stats.lastFail = Date.now();
+    if (stats.streak >= 2) {
+      var index = Math.min(stats.streak, COOLDOWNS_MS.length - 1);
+      stats.cooldownUntil = Date.now() + COOLDOWNS_MS[index];
+    }
+    saveCache();
+  }
+
+  function providerStatuses() {
+    return providers.map(function (provider) {
+      var h = providerHealth(provider);
+      return {
+        id: provider.id, name: provider.name, discovery: !!provider.discovery,
+        successes: h.successes, empty: h.empty, failures: h.failures,
+        streak: h.streak, cooldownUntil: h.cooldownUntil,
+        available: providerAvailable(provider, false)
+      };
+    });
+  }
+
+  function withTimeout(work, timeoutMs, label) {
+    var timer;
+    return Promise.race([
+      Promise.resolve().then(work),
+      new Promise(function (_, reject) {
+        timer = setTimeout(function () { reject(new Error('Timeout: ' + label)); }, timeoutMs);
+      })
+    ]).then(function (result) {
+      clearTimeout(timer);
+      return result;
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
+    });
+  }
+
+  function providerTimeout(provider) {
+    return Math.max(50, Math.min(30000, Number(provider.timeoutMs) || 12000));
+  }
+
+  function movieKey(movie) {
+    var kind = movie.media_type === 'tv' ? 'tv' : 'movie';
+    var episodeSuffix = '';
+    if (kind === 'tv') {
+      var card = movie.card || {};
+      var season = Number(card.season_number || card.season || 0);
+      var episode = Number(card.episode_number || card.episode || 0);
+      if (season > 0 && episode > 0) episodeSuffix = ':S' + season + ':E' + episode;
+    }
+    if (movie.tmdb_id != null && movie.tmdb_id !== '') return 'tmdb:' + kind + ':' + movie.tmdb_id + episodeSuffix;
+    if (movie.imdb_id) return 'imdb:' + movie.imdb_id + episodeSuffix;
+    return 'title:' + kind + ':' + normalize(movie.original_title || movie.title) + ':' + movie.year + episodeSuffix;
+  }
+
+  function getMovieEntry(movie, create) {
+    var key = movieKey(movie);
+    if (!Object.prototype.hasOwnProperty.call(cache.movies, key) && create) {
+      cache.movies[key] = { updated: Date.now(), providers: {} };
+    }
+    return cache.movies[key] || null;
+  }
+
+  function cachedCandidates(movie, provider) {
+    var record = getMovieEntry(movie, false);
+    var entry = record && record.providers[provider.id];
+    if (!entry || !Array.isArray(entry.items) || !entry.items.length) return null;
+    return entry.items;
+  }
+
+  function recentMiss(movie, provider) {
+    var record = getMovieEntry(movie, false);
+    var entry = record && record.providers[provider.id];
+    return !!(entry && Array.isArray(entry.items) && !entry.items.length &&
+      Number(entry.negativeUntil || 0) > Date.now());
+  }
+
+  function domainOf(url) {
+    var match = String(url || '').match(/^https?:\/\/([^\/:?#\s]+)(?::[0-9]+)?(?:[\/?#]|$)/i);
+    return match ? match[1].toLowerCase() : '';
+  }
+
+  function recordSite(item, provider) {
+    // A discovered hostname is informational: it is NOT a new executable adapter.
+    var host = domainOf(item.sourceUrl || item.url || provider.siteUrl || '');
+    if (!host) return;
+    var now = Date.now();
+    var existing = cache.sites[host] || {
+      host: host, providers: [], firstSeen: now, matches: 0
+    };
+    if (existing.providers.indexOf(provider.id) === -1) existing.providers.push(provider.id);
+    existing.lastSeen = now;
+    existing.matches += 1;
+    cache.sites[host] = existing;
+  }
+
+  function rememberCandidates(movie, provider, items) {
+    var prepared = [];
+    // A provider might return non-serializable values; skip only those values.
+    items.slice(0, MAX_RESULTS).forEach(function (item) {
+      if (!item || typeof item !== 'object') return;
+      try {
+        var clean = JSON.parse(JSON.stringify(item));
+        if (!clean || Array.isArray(clean) || typeof clean !== 'object') return;
+        prepared.push(clean);
+        recordSite(clean, provider);
+      } catch (err) { console.warn('[VideoFinder] Ignored non-serializable item', err); }
+    });
+    var record = getMovieEntry(movie, !!prepared.length);
+    if (prepared.length) {
+      // Reset resolved streams on explicit refresh; candidates may have changed.
+      record.providers[provider.id] = { items: prepared, savedAt: Date.now() };
+      record.updated = Date.now();
+    } else {
+      // A successful empty search is different from a network error.
+      // Remember misses briefly, but never discard previously found candidates.
+      record = getMovieEntry(movie, true);
+      if (!record.providers[provider.id] || !record.providers[provider.id].items.length) {
+        record.providers[provider.id] = {
+          items: [], savedAt: Date.now(), negativeUntil: Date.now() + MISS_TTL_MS
+        };
+      }
+      record.updated = Date.now();
+    }
+    saveCache();
+    return prepared;
+  }
+
+  function cachedStreams(movie, provider, item) {
+    if (!provider.persistStreams || item.id == null) return null;
+    var record = getMovieEntry(movie, false);
+    var entry = record && record.providers[provider.id];
+    var stream = entry && entry.streams && entry.streams[String(item.id)];
+    if (!stream || !Array.isArray(stream.items) || !stream.items.length) return null;
+    // Stable static URLs only; never cache short-lived signed URLs from other adapters.
+    if (Date.now() - stream.savedAt > 7 * 24 * 60 * 60 * 1000) return null;
+    return stream.items;
+  }
+
+  function rememberStreams(movie, provider, item, streams) {
+    if (!provider.persistStreams || item.id == null) return;
+    var record = getMovieEntry(movie, false);
+    var entry = record && record.providers[provider.id];
+    if (!entry) return;
+    try {
+      var clean = JSON.parse(JSON.stringify(streams.slice(0, 25)));
+      clean = clean.filter(function (stream) {
+        return stream && typeof stream.url === 'string' && domainOf(stream.url);
+      });
+      if (!clean.length) return;
+      if (!entry.streams) entry.streams = {};
+      entry.streams[String(item.id)] = { savedAt: Date.now(), items: clean };
+      saveCache();
+    } catch (err) { console.warn('[VideoFinder] Cannot cache streams', err); }
+  }
+
+  function forgetMovie(movie) {
+    delete cache.movies[movieKey(movie)];
+    saveCache();
+  }
+
+  function sourceList() {
+    return Object.keys(cache.sites).map(function (key) {
+      return cache.sites[key];
+    }).sort(function (a, b) { return b.lastSeen - a.lastSeen; });
+  }
+
+  function showProviders() {
+    var status = providerStatuses();
+    L.Select.show({
+      title: 'Подключённые источники · ' + status.length,
+      items: status.map(function (p) {
+        var label = p.available ? 'доступен' : 'пауза до ' + new Date(p.cooldownUntil).toLocaleTimeString();
+        return { title: p.name, subtitle: label + ' · найдено: ' + p.successes +
+          ' · пусто: ' + p.empty + ' · ошибок: ' + p.failures +
+          (p.discovery ? ' · поисковик' : ' · каталог') };
+      }),
+      onSelect: function () { notify('Обновить все источники можно из меню результатов'); },
+      onBack: function () { L.Controller.toggle('content'); }
+    });
+  }
+
+  function showSources() {
+    var sources = sourceList();
+    if (!sources.length) { notify('Пока нет сохранённых сайтов'); return; }
+    L.Select.show({
+      title: 'Найденные сайты · ' + sources.length,
+      items: sources.map(function (source) {
+        return { title: source.host, subtitle: 'Через ' + source.providers.join(', ') + ' · находок: ' + source.matches };
+      }),
+      onSelect: function () { notify('Это каталог обнаруженных сайтов, не отдельные плагины'); },
+      onBack: function () { L.Controller.toggle('content'); }
+    });
+  }
+
+  function registerProvider(provider) {
+    if (!provider || !provider.id || !provider.name ||
+        typeof provider.search !== 'function' || typeof provider.resolve !== 'function') {
+      throw new Error('A provider requires id, name, search(movie), resolve(item)');
+    }
+    for (var i = 0; i < providers.length; i++) {
+      if (providers[i].id === provider.id) throw new Error('Duplicate provider id: ' + provider.id);
+    }
+    if (provider.supports != null && typeof provider.supports !== 'function') {
+      throw new Error('supports must be a function(movie)');
+    }
+    providers.push(provider);
+  }
+
+  function unregisterProvider(id) {
+    providers = providers.filter(function (provider) { return provider.id !== id; });
+  }
+
+  function registerAction(action) {
+    if (!action || !action.id || !action.title || typeof action.open !== 'function') {
+      throw new Error('An action requires id, title, open(movie)');
+    }
+    for (var i = 0; i < actions.length; i++) {
+      if (actions[i].id === action.id) throw new Error('Duplicate action: ' + action.id);
+    }
+    actions.push(action);
+  }
+
+  function chooseStream(item, video, movie, provider) {
+    var stream = null;
+    var rawStream = String(video && video.url || '');
+    try {
+      if (typeof URL === 'function') stream = new URL(rawStream);
+    } catch (_) { /* old Tizen may not expose URL */ }
+    if (!stream && /^https?:\/\/[^\s\/?#]+(?:[^\s]*)?$/i.test(rawStream)) {
+      stream = { href: rawStream, protocol: rawStream.slice(0, 6).toLowerCase() === 'https:' ? 'https:' : 'http:' };
+    }
+    if (!stream || !/^https?:$/.test(stream.protocol)) {
+      notify('Источник вернул неправильный URL', true);
+      return;
+    }
+    try {
+      L.Select.close();
+      L.Player.play({
+        url: stream.href,
+        title: movie.title + ' — ' + (item.title || provider.name),
+        movie: movie.card
+      });
+    } catch (err) {
+      console.error('[VideoFinder] Playback failed', err);
+      notify('Не удалось запустить воспроизведение', true);
+    }
+  }
+
+  function openStreams(item, provider, movie) {
+    notify('Получаю список видео...');
+    var saved = cachedStreams(movie, provider, item);
+    withTimeout(function () {
+      return saved || provider.resolve(item, movie);
+    }, providerTimeout(provider), 'resolve ' + provider.id).then(function (streams) {
+      if (!Array.isArray(streams) || !streams.length) {
+        notify('Для выбранной записи нет доступных MP4-потоков', true);
+        return;
+      }
+      if (!saved) {
+        recordProviderSuccess(provider, streams.length);
+        rememberStreams(movie, provider, item, streams);
+      }
+      L.Select.show({
+        title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
+        items: streams,
+        onSelect: function (stream) { chooseStream(item, stream, movie, provider); },
+        onBack: function () { L.Controller.toggle('content'); }
+      });
+    }).catch(function (err) {
+      recordProviderFailure(provider);
+      console.error('[VideoFinder] Resolve failed:', provider.id, err);
+      notify('Не удалось получить поток. Возможны CORS/сетевая ошибка.', true);
+    });
+  }
+
+  function queryProvider(provider, movie) {
+    return withTimeout(function () { return provider.search(movie); }, providerTimeout(provider),
+      'search ' + provider.id).then(function (items) {
+      if (!Array.isArray(items)) throw new Error('Expected an array of candidates');
+      recordProviderSuccess(provider, items.length);
+      return { provider: provider, items: rememberCandidates(movie, provider, items), cached: false };
+    }).catch(function (err) {
+      recordProviderFailure(provider);
+      console.error('[VideoFinder] Search failed:', provider.id, err);
+      // Preserve the last good results; never cache errors as valid empty searches.
+      return { provider: provider, items: cachedCandidates(movie, provider) || [], cached: true };
+    });
+  }
+
+  function openResults(movie, refresh) {
+    if (!movie.title) {
+      notify('В карточке нет названия фильма', true);
+      return;
+    }
+    if (busy) return;
+    busy = true;
+    var cachedGroups = refresh ? [] : providers.map(function (provider) {
+      var saved = cachedCandidates(movie, provider);
+      return saved ? { provider: provider, items: saved, cached: true } : null;
+    }).filter(Boolean);
+
+    var cacheHit = cachedGroups.length > 0;
+    var sourceProviders = providers.filter(function (provider) { return !provider.discovery; });
+    var discoveryProviders = providers.filter(function (provider) { return provider.discovery; });
+    var networkCount = 0;
+
+    if (refresh) notify('Обновляю результаты: ' + movie.title);
+
+    function searchGroup(group) {
+      var active = group.filter(function (provider) {
+        try {
+          if (provider.supports && !provider.supports(movie)) return false;
+        } catch (err) {
+          console.warn('[VideoFinder] supports() failed:', provider.id, err);
+          return false;
+        }
+        // Manual refresh overrides both the negative cache and the cooldown.
+        return (refresh || !recentMiss(movie, provider)) && providerAvailable(provider, refresh);
+      });
+      networkCount += active.length;
+      return Promise.all(active.map(function (provider) { return queryProvider(provider, movie); }));
+    }
+
+    // For an already found movie never ask search engines again. For a new
+    // movie, ask specialized source adapters first, discovery engines last.
+    var tasks = cacheHit ? Promise.resolve(cachedGroups) :
+      searchGroup(sourceProviders).then(function (primary) {
+        if (refresh) {
+          return searchGroup(discoveryProviders).then(function (found) {
+            return primary.concat(found);
+          });
+        }
+        if (primary.some(function (group) { return group.items.length; })) return primary;
+        return searchGroup(discoveryProviders).then(function (found) {
+          return primary.concat(found);
+        });
+      });
+
+    tasks.then(function (groups) {
+      var results = [];
+      groups.forEach(function (group) {
+        group.items.forEach(function (item) {
+          results.push({
+            title: item.title || 'Видео',
+            subtitle: (item.subtitle ? item.subtitle + ' · ' : '') + group.provider.name +
+              (group.cached ? ' · сохранено' : ''),
+            _item: item,
+            _provider: group.provider,
+            _rank: Number(item.confidence) || 0
+          });
+        });
+      });
+      results.sort(function (a, b) { return b._rank - a._rank; });
+
+      if (!results.length) {
+        notify('Видео не найдено. Можно обновить поиск вручную.', true);
+      }
+      var menuActions = actions.map(function (action) {
+        return { title: action.title, subtitle: action.subtitle || '', _actionHandler: action };
+      });
+      var entries = results.concat(menuActions, [
+        { title: '↻ Обновить поиск', subtitle: 'Проверить все источники заново', _action: 'refresh' },
+        { title: 'Подключённые источники (' + providers.length + ')',
+          subtitle: 'Доступность и статистика', _action: 'providers' },
+        { title: 'Найденные сайты (' + sourceList().length + ')',
+          subtitle: 'Локально сохранённые сайты', _action: 'sources' }
+      ]);
+      L.Select.show({
+        title: 'Видео · ' + movie.title + (networkCount === 0 ? ' · из памяти' : ''),
+        items: entries,
+        onSelect: function (selected) {
+          if (selected._actionHandler) { selected._actionHandler.open(movie); return; }
+          if (selected._action === 'refresh') { L.Select.close(); openResults(movie, true); return; }
+          if (selected._action === 'sources') { showSources(); return; }
+          if (selected._action === 'providers') { showProviders(); return; }
+          L.Select.close();
+          openStreams(selected._item, selected._provider, movie);
+        },
+        onBack: function () { L.Controller.toggle('content'); }
+      });
+      if (networkCount === 0 && cacheHit) notify('Показываю сохранённые результаты');
+    }).catch(function (err) {
+      console.error('[VideoFinder] Unexpected search error', err);
+      notify('Ошибка поиска видео', true);
+    }).then(function () { busy = false; });
+  }
+
+  // Additional adapters can be attached from another script after this one.
+  window.LampaVideoFinder = {
+    requestJson: httpJson,
+    registerProvider: registerProvider,
+    unregisterProvider: unregisterProvider,
+    registerAction: registerAction,
+    listProviders: function () { return providers.map(function (p) { return p.id; }); },
+    listKnownSources: sourceList,
+    listProviderHealth: providerStatuses,
+    clearMovieCache: function (card) { forgetMovie(movieInfo(card)); },
+    clearCache: function () { cache = { version: 2, movies: {}, sites: {}, health: {} }; saveCache(); },
+    cacheStats: function () { return { movies: Object.keys(cache.movies).length, sites: sourceList().length }; }
+  };
+
+  registerProvider({
+    id: 'archive',
+    name: 'Internet Archive',
+    siteUrl: 'https://archive.org',
+    persistStreams: true,
+    // Archive's catalog is a movie catalog, not a season/episode resolver.
+    supports: function (movie) { return movie.media_type !== 'tv'; },
+    search: searchArchive,
+    resolve: resolveArchive
+  });
+
+  function init() {
+    Lampa.Manifest.plugins = {
+      type: 'video',
+      name: 'Video Finder',
+      version: '0.5.2',
+      description: 'Поиск видео с локальным сохранением найденных источников',
+      onContextMenu: function () {
+        return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
+      },
+      onContextLauch: function (card) { openResults(movieInfo(card)); }
+    };
+    console.log('[VideoFinder] Installed. Providers:', window.LampaVideoFinder.listProviders());
+  }
+
+  function safeInit() {
+    try { init(); }
+    catch (error) {
+      console.error('[PluginLampa] Initialization failed', error);
+      window.__lampa_video_finder_v1 = false;
+    }
+  }
+  if (window.appready) safeInit();
+  else L.Listener.follow('app', function (event) {
+    if (event.type === 'ready') safeInit();
+  });
+})();
+
+/*
+ * PluginLampa Rutube provider (independent JS implementation, 2026-10-18).
+ * API inspiration: Lampac / Modules/OnlineRUS/RutubeMovie (AGPL-3.0).
+ * No Lampac source text reused in this file. Requires compatible CORS.
+ */
+(function () {
+  'use strict';
+  var engine = window.LampaVideoFinder;
+  if (!engine || typeof engine.registerProvider !== 'function') {
+    console.warn('[VideoFinder] Load lampa-video-finder.js before providers/rutube.js');
+    return;
+  }
+  if (engine.listProviders().indexOf('rutube') !== -1) return;
+
+  function clean(text) {
+    return String(text || '').toLowerCase()
+      .replace(/[^a-z0-9\u0400-\u04ff]+/g, ' ').trim();
+  }
+  function validStream(text) {
+    text = String(text || '');
+    if (!/^https?:\/\/[^\s\/?#]+(?:[^\s]*)?$/i.test(text)) return '';
+    if (typeof URL !== 'function') return text;
+    try {
+      var url = new URL(text);
+      return /^https?:$/.test(url.protocol) ? url.href : '';
+    } catch (_) { return ''; }
+  }
+  function getJson(url) { return engine.requestJson(url); }
+
+  function isMatch(candidate, movie) {
+    var title = clean(candidate.title);
+    var localized = clean(movie.title);
+    var original = clean(movie.original_title);
+    if (!title) return false;
+    if ((localized && title.indexOf(localized) === -1) &&
+        (original && title.indexOf(original) === -1)) return false;
+    if (/\b(trailer|teaser|review|reaction|recap)\b|трейлер|тизер|обзор|реакция|анонс|сериал|серия/i.test(title)) return false;
+    if (Number(candidate.duration || 0) < 3000) return false;
+    if (candidate.is_deleted || candidate.is_hidden || candidate.is_locked ||
+        candidate.is_paid || candidate.is_adult || candidate.is_livestream) return false;
+    return !candidate.category || Number(candidate.category.id) === 4;
+  }
+  function searchOne(name, movie) {
+    var query = [name, movie.year].filter(Boolean).join(' ');
+    var url = 'https://rutube.ru/api/search/video/?content_type=video&duration=movie&query=' +
+      encodeURIComponent(query);
+    return getJson(url).then(function (data) {
+      var list = Array.isArray(data.results) ? data.results : [];
+      return list.filter(function (entry) { return entry && entry.id != null && isMatch(entry, movie); })
+        .map(function (entry) {
+          var hasYear = !movie.year || clean(entry.title).indexOf(String(movie.year)) !== -1;
+          var href = validStream(entry.video_url || entry.url || '');
+          return {
+            id: String(entry.id),
+            title: String(entry.title),
+            subtitle: 'Rutube · ' + Math.round(Number(entry.duration) / 60) + ' мин',
+            sourceUrl: href || 'https://rutube.ru/video/' + encodeURIComponent(String(entry.id)) + '/',
+            confidence: hasYear ? 85 : 60
+          };
+        });
+    });
+  }
+  function search(movie) {
+    var names = [movie.title];
+    if (clean(movie.original_title) !== clean(movie.title)) names.push(movie.original_title);
+    return Promise.all(names.filter(Boolean).map(function (name) {
+      return searchOne(name, movie).then(function (items) { return { ok: true, items: items }; })
+        .catch(function (error) { console.warn('[Rutube] Search failed:', error); return { ok: false, items: [] }; });
+    })).then(function (groups) {
+      if (!groups.length || !groups.some(function (group) { return group.ok; })) {
+        throw new Error('Rutube search unavailable');
+      }
+      var unique = Object.create(null);
+      groups.forEach(function (group) {
+        group.items.forEach(function (item) {
+          if (!unique[item.id] || unique[item.id].confidence < item.confidence) unique[item.id] = item;
+        });
+      });
+      return Object.keys(unique).map(function (id) { return unique[id]; });
+    });
+  }
+  function resolve(item) {
+    if (!item || !/^[a-zA-Z0-9_-]{1,100}$/.test(String(item.id || ''))) {
+      return Promise.reject(new Error('Invalid Rutube ID'));
+    }
+    var url = 'https://rutube.ru/api/play/options/' + encodeURIComponent(item.id) +
+      '/?no_404=true&referer=&pver=v2&client=wdp';
+    return getJson(url).then(function (data) {
+      var balancer = data && data.video_balancer;
+      var hls = balancer && validStream(balancer.m3u8);
+      if (!hls) return [];
+      // Short-lived signed streams are never saved in the host's local cache.
+      return [{ title: item.title + ' · HLS', subtitle: 'm3u8', url: hls }];
+    });
+  }
+  engine.registerProvider({
+    id: 'rutube', name: 'Rutube', siteUrl: 'https://rutube.ru',
+    timeoutMs: 12000, persistStreams: false,
+    supports: function (movie) { return movie.media_type !== 'tv'; },
+    search: search, resolve: resolve
+  });
+})();
+
