@@ -550,7 +550,8 @@ SOFTWARE.
       recordProviderFailure(provider);
       console.error('[VideoFinder] Search failed:', provider.id, err);
       // Preserve the last good results; never cache errors as valid empty searches.
-      return { provider: provider, items: cachedCandidates(movie, provider) || [], cached: true };
+      return { provider: provider, items: cachedCandidates(movie, provider) || [],
+        cached: true, error: String(err && err.message || err) };
     });
   }
 
@@ -561,7 +562,11 @@ SOFTWARE.
     }
     if (busy) return;
     busy = true;
-    var selectedProviders = providers.filter(function (p) { return !!p.titleSearch === !!titleSearch; });
+    var scope = titleSearch || 'all';
+    var selectedProviders = providers.filter(function (p) {
+      return scope === 'all' || (scope === 'titles' ? !!p.titleSearch : !p.titleSearch);
+    });
+    var diagnostics = [];
     var cachedGroups = refresh ? [] : selectedProviders.map(function (provider) {
       var saved = cachedCandidates(movie, provider);
       return saved ? { provider: provider, items: saved, cached: true } : null;
@@ -577,32 +582,51 @@ SOFTWARE.
     function searchGroup(group) {
       var active = group.filter(function (provider) {
         try {
-          if (provider.supports && !provider.supports(movie)) return false;
+          if (provider.supports && !provider.supports(movie)) {
+            diagnostics.push({provider: provider, status: provider.unavailableReason ?
+              provider.unavailableReason(movie) : 'неподдерживаемый тип или ID'});
+            return false;
+          }
         } catch (err) {
           console.warn('[VideoFinder] supports() failed:', provider.id, err);
+          diagnostics.push({provider: provider, status: 'ошибка проверки ID'});
           return false;
         }
         // Manual refresh overrides both the negative cache and the cooldown.
-        return (refresh || !recentMiss(movie, provider)) && providerAvailable(provider, refresh);
+        if (!refresh && cachedCandidates(movie, provider)) {
+          diagnostics.push({provider: provider, status: 'результаты из памяти'});
+          return false;
+        }
+        if (!refresh && recentMiss(movie, provider)) {
+          diagnostics.push({provider: provider, status: 'недавний пустой ответ, нажми ↻'});
+          return false;
+        }
+        if (!providerAvailable(provider, refresh)) {
+          diagnostics.push({provider: provider, status: 'пауза после ошибок, нажми ↻'});
+          return false;
+        }
+        return true;
       });
       networkCount += active.length;
-      return Promise.all(active.map(function (provider) { return queryProvider(provider, movie); }));
+      return Promise.all(active.map(function (provider) {
+        return queryProvider(provider, movie).then(function (result) {
+          diagnostics.push({provider: provider, status: result.error ?
+            'Ошибка: ' + result.error : result.items.length ?
+            'найдено: ' + result.items.length : 'ответ без подходящих прямых видео'});
+          return result;
+        });
+      }));
     }
 
     // For an already found movie never ask search engines again. For a new
     // movie, ask specialized source adapters first, discovery engines last.
-    var tasks = cacheHit ? Promise.resolve(cachedGroups) :
-      searchGroup(sourceProviders).then(function (primary) {
-        if (refresh) {
-          return searchGroup(discoveryProviders).then(function (found) {
-            return primary.concat(found);
-          });
-        }
-        if (primary.some(function (group) { return group.items.length; })) return primary;
-        return searchGroup(discoveryProviders).then(function (found) {
-          return primary.concat(found);
-        });
+    var tasks = searchGroup(sourceProviders).then(function (primary) {
+      var all = cachedGroups.concat(primary);
+      if (!refresh && all.some(function (group) { return group.items.length; })) return all;
+      return searchGroup(discoveryProviders).then(function (found) {
+        return all.concat(found);
       });
+    });
 
     tasks.then(function (groups) {
       var results = [];
@@ -611,6 +635,7 @@ SOFTWARE.
           results.push({
             title: item.title || 'Видео',
             subtitle: (item.subtitle ? item.subtitle + ' · ' : '') + group.provider.name +
+              (group.provider.titleSearch ? ' · совпадение по названию (проверь)' : '') +
               (group.cached ? ' · сохранено' : ''),
             _item: item,
             _provider: group.provider,
@@ -621,13 +646,17 @@ SOFTWARE.
       results.sort(function (a, b) { return b._rank - a._rank; });
 
       if (!results.length) {
-        notify('Видео не найдено. Можно обновить поиск вручную.', true);
+        notify('0 результатов: открой «Диагностика источников» и проверь причины.', true);
       }
       var menuActions = actions.map(function (action) {
         return { title: action.title, subtitle: action.subtitle || '', _actionHandler: action };
       });
       var entries = results.concat(menuActions, [
-        { title: titleSearch ? 'Вернуться к точным источникам' : 'Поиск по названию · неподтверждённые видео', _action: 'titles' },
+        { title: 'Диагностика источников (' + selectedProviders.length + ')', _action: 'diagnostics',
+          subtitle: networkCount + ' запросов · причины нулевых результатов' },
+        { title: 'Режим: ' + (scope === 'all' ? 'Все источники' : scope === 'titles' ?
+          'Только по названию' : 'Только точные Stremio'),
+          subtitle: 'Сменить режим поиска', _action: 'titles' },
         { title: '↻ Обновить поиск', subtitle: 'Проверить все источники заново', _action: 'refresh' },
         { title: 'Подключённые источники (' + providers.length + ')',
           subtitle: 'Доступность и статистика', _action: 'providers' },
@@ -640,7 +669,22 @@ SOFTWARE.
         onSelect: function (selected) {
           if (selected._actionHandler) { selected._actionHandler.open(movie); return; }
           if (selected._action === 'refresh') { L.Select.close(); openResults(movie, true, titleSearch); return; }
-          if (selected._action === 'titles') { L.Select.close(); openResults(movie, false, !titleSearch); return; }
+          if (selected._action === 'titles') {
+            L.Select.close();
+            openResults(movie, false, scope === 'all' ? 'exact' : scope === 'exact' ? 'titles' : 'all');
+            return;
+          }
+          if (selected._action === 'diagnostics') {
+            L.Select.show({
+              title: 'Источники · ' + movie.title,
+              items: diagnostics.length ? diagnostics.map(function (d) {
+                return {title: d.provider.name, subtitle: d.status};
+              }) : [{title: 'Подключённых источников нет'}],
+              onSelect: function () {},
+              onBack: function () { L.Controller.toggle('content'); }
+            });
+            return;
+          }
           if (selected._action === 'sources') { showSources(); return; }
           if (selected._action === 'providers') { showProviders(); return; }
           L.Select.close();
@@ -686,7 +730,7 @@ SOFTWARE.
     Lampa.Manifest.plugins = {
       type: 'video',
       name: 'Video Finder',
-      version: '0.6.0',
+      version: '0.6.1',
       description: 'Поиск видео с локальным сохранением найденных источников',
       onContextMenu: function () {
         return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
@@ -701,18 +745,33 @@ SOFTWARE.
       button.on('hover:enter', function () { openCard(event.data.movie); });
       container.append(button);
     });
-    console.log('[VideoFinder] Installed v0.6.0. Providers:', window.LampaVideoFinder.listProviders());
+    console.log('[VideoFinder] Installed v0.6.1. Providers:', window.LampaVideoFinder.listProviders());
   }
 
   function openCard(card) {
+    card = card || {};
     var movie = movieInfo(card);
     if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id) {
       openResults(movie); return;
     }
-    L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
-      card.imdb_id = id || '';
-      openResults(movieInfo(card));
-    });
+    if (typeof L.Api.sources.tmdb.external_imdb_id !== 'function') {
+      openResults(movie); return;
+    }
+    var completed = false;
+    var timer = setTimeout(function () {
+      if (!completed) { completed = true; openResults(movie); }
+    }, 6000);
+    try {
+      L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timer);
+        card.imdb_id = id || '';
+        openResults(movieInfo(card));
+      });
+    } catch (err) {
+      if (!completed) { completed = true; clearTimeout(timer); openResults(movie); }
+    }
   }
 
   function safeInit() {
@@ -980,6 +1039,11 @@ SOFTWARE.
       id: addon.providerId, name: 'Stremio · ' + addon.manifest.name,
       siteUrl: addon.url, persistStreams: false, timeoutMs: 12000,
       supports: function (movie) { return !!idFor(addon, movie); },
+      unavailableReason: function (movie) {
+        if (movie.media_type === 'tv' && !episode(movie)) return 'нужно открыть конкретную серию';
+        if (!movie.imdb_id && !movie.tmdb_id) return 'в карточке нет IMDb/TMDB ID';
+        return 'расширение не поддерживает этот формат ID или тип видео';
+      },
       search: function (movie) {
         var key = idFor(addon, movie);
         if (!key) return Promise.resolve([]);
@@ -1051,7 +1115,7 @@ SOFTWARE.
       function (value) {
         if (!value) return;
         install(value).then(function (item) {
-          engine.clearCache(); notify('Добавлено: ' + item.name);
+          notify('Добавлено: ' + item.name);
           manage();
         }).catch(function (err) { notify('Ошибка расширения: ' + err.message, true); });
       });
@@ -1071,7 +1135,7 @@ SOFTWARE.
       L.Select.show({title: 'Официальный список Stremio', items: choices,
         onSelect: function (choice) {
           install(choice.url).then(function (item) {
-            engine.clearCache(); notify('Добавлено: ' + item.name); manage();
+            notify('Добавлено: ' + item.name); manage();
           }).catch(function (err) { notify('Не удалось добавить: ' + err.message, true); });
         }, onBack: manage});
     }).catch(function () { notify('Не удалось загрузить список. Можно добавить ссылку вручную.', true); manage(); });
