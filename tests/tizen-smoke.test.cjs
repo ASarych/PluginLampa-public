@@ -37,16 +37,14 @@ const window = { Lampa, appready: true };
 const sandbox = { window, Lampa, Promise, Date, setTimeout, clearTimeout, console, URL: undefined };
 vm.runInNewContext(script, sandbox, {filename:'PluginLampa-tizen.js'});
 assert.equal(events.registrations.length, 1);
-assert.equal(events.registrations[0].version, '0.6.0');
+assert.equal(events.registrations[0].version, '0.6.1');
 assert.deepEqual(Array.from(window.LampaVideoFinder.listProviders()), ['archive','rutube']);
 async function settle(){for(let n=0;n<25;n++) await new Promise(r=>setImmediate(r));}
 (async()=>{
   events.registrations[0].onContextLauch({id:1,title:'Sintel',original_title:'Sintel',year:2010});
   await settle();
   assert(events.menus.length>0, 'Results menu opens');
-  assert(!events.urls.some(url=>url.includes('/api/search/video/')), 'Title search is opt-in');
-  events.menus.at(-1).onSelect(events.menus.at(-1).items.find(x=>x._action==='titles'));
-  await settle();
+  assert(events.urls.some(url=>url.includes('/api/search/video/')), 'Title search must run in the default all-sources mode');
   const result=events.menus.at(-1).items.find(x=>x._provider && x._provider.id==='rutube');
   assert(result, 'Rutube result available');
   events.menus.at(-1).onSelect(result);
