@@ -45,7 +45,7 @@ SOFTWARE.
   var providers = [];
   var actions = [];
   var busy = false;
-  var CACHE_KEY = 'video_finder_cache_v2';
+  var CACHE_KEY = 'video_finder_cache_v3';
   var MAX_MOVIES = 120;
   var MAX_RESULTS = 25;
   var MAX_SITES = 150;
@@ -67,7 +67,7 @@ SOFTWARE.
       title: String(title),
       original_title: String(original),
       year: String(year),
-      imdb_id: String(card.imdb_id || ''),
+      imdb_id: String(card.imdb_id || (card.external_ids && card.external_ids.imdb_id) || ''),
       tmdb_id: card.id || null,
       media_type: card.media_type || (card.first_air_date || card.number_of_seasons ? 'tv' : 'movie'),
       card: card
@@ -554,21 +554,22 @@ SOFTWARE.
     });
   }
 
-  function openResults(movie, refresh) {
+  function openResults(movie, refresh, titleSearch) {
     if (!movie.title) {
       notify('В карточке нет названия фильма', true);
       return;
     }
     if (busy) return;
     busy = true;
-    var cachedGroups = refresh ? [] : providers.map(function (provider) {
+    var selectedProviders = providers.filter(function (p) { return !!p.titleSearch === !!titleSearch; });
+    var cachedGroups = refresh ? [] : selectedProviders.map(function (provider) {
       var saved = cachedCandidates(movie, provider);
       return saved ? { provider: provider, items: saved, cached: true } : null;
     }).filter(Boolean);
 
     var cacheHit = cachedGroups.length > 0;
-    var sourceProviders = providers.filter(function (provider) { return !provider.discovery; });
-    var discoveryProviders = providers.filter(function (provider) { return provider.discovery; });
+    var sourceProviders = selectedProviders.filter(function (provider) { return !provider.discovery; });
+    var discoveryProviders = selectedProviders.filter(function (provider) { return provider.discovery; });
     var networkCount = 0;
 
     if (refresh) notify('Обновляю результаты: ' + movie.title);
@@ -626,6 +627,7 @@ SOFTWARE.
         return { title: action.title, subtitle: action.subtitle || '', _actionHandler: action };
       });
       var entries = results.concat(menuActions, [
+        { title: titleSearch ? 'Вернуться к точным источникам' : 'Поиск по названию · неподтверждённые видео', _action: 'titles' },
         { title: '↻ Обновить поиск', subtitle: 'Проверить все источники заново', _action: 'refresh' },
         { title: 'Подключённые источники (' + providers.length + ')',
           subtitle: 'Доступность и статистика', _action: 'providers' },
@@ -637,7 +639,8 @@ SOFTWARE.
         items: entries,
         onSelect: function (selected) {
           if (selected._actionHandler) { selected._actionHandler.open(movie); return; }
-          if (selected._action === 'refresh') { L.Select.close(); openResults(movie, true); return; }
+          if (selected._action === 'refresh') { L.Select.close(); openResults(movie, true, titleSearch); return; }
+          if (selected._action === 'titles') { L.Select.close(); openResults(movie, false, !titleSearch); return; }
           if (selected._action === 'sources') { showSources(); return; }
           if (selected._action === 'providers') { showProviders(); return; }
           L.Select.close();
@@ -655,6 +658,7 @@ SOFTWARE.
   // Additional adapters can be attached from another script after this one.
   window.LampaVideoFinder = {
     requestJson: httpJson,
+    open: function (card) { openResults(movieInfo(card)); },
     registerProvider: registerProvider,
     unregisterProvider: unregisterProvider,
     registerAction: registerAction,
@@ -668,6 +672,7 @@ SOFTWARE.
 
   registerProvider({
     id: 'archive',
+    titleSearch: true,
     name: 'Internet Archive',
     siteUrl: 'https://archive.org',
     persistStreams: true,
@@ -681,14 +686,33 @@ SOFTWARE.
     Lampa.Manifest.plugins = {
       type: 'video',
       name: 'Video Finder',
-      version: '0.5.2',
+      version: '0.6.0',
       description: 'Поиск видео с локальным сохранением найденных источников',
       onContextMenu: function () {
         return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
       },
-      onContextLauch: function (card) { openResults(movieInfo(card)); }
+      onContextLauch: openCard
     };
-    console.log('[VideoFinder] Installed. Providers:', window.LampaVideoFinder.listProviders());
+    L.Listener.follow('full', function (event) {
+      if (event.type !== 'complite' || !event.body || !window.$) return;
+      var container = event.body.find('.buttons--container');
+      if (!container.length || container.find('.pluginlampa-watch').length) return;
+      var button = $('<div class="full-start__button selector pluginlampa-watch"><span>PluginLampa</span></div>');
+      button.on('hover:enter', function () { openCard(event.data.movie); });
+      container.append(button);
+    });
+    console.log('[VideoFinder] Installed v0.6.0. Providers:', window.LampaVideoFinder.listProviders());
+  }
+
+  function openCard(card) {
+    var movie = movieInfo(card);
+    if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id) {
+      openResults(movie); return;
+    }
+    L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
+      card.imdb_id = id || '';
+      openResults(movieInfo(card));
+    });
   }
 
   function safeInit() {
@@ -738,8 +762,9 @@ SOFTWARE.
     var localized = clean(movie.title);
     var original = clean(movie.original_title);
     if (!title) return false;
-    if ((localized && title.indexOf(localized) === -1) &&
-        (original && title.indexOf(original) === -1)) return false;
+    var names = [localized, original].filter(Boolean);
+    if (!names.some(function (name) { return (' ' + title + ' ').indexOf(' ' + name + ' ') !== -1; })) return false;
+    if (movie.year && title.indexOf(String(movie.year)) === -1) return false;
     if (/\b(trailer|teaser|review|reaction|recap)\b|трейлер|тизер|обзор|реакция|анонс|сериал|серия/i.test(title)) return false;
     if (Number(candidate.duration || 0) < 3000) return false;
     if (candidate.is_deleted || candidate.is_hidden || candidate.is_locked ||
@@ -801,9 +826,285 @@ SOFTWARE.
   }
   engine.registerProvider({
     id: 'rutube', name: 'Rutube', siteUrl: 'https://rutube.ru',
+    titleSearch: true,
     timeoutMs: 12000, persistStreams: false,
     supports: function (movie) { return movie.media_type !== 'tv'; },
     search: search, resolve: resolve
   });
 })();
+
+
+
+/*
+ * Stremio HTTP addon protocol adapter for PluginLampa.
+ * Independent implementation based on the public protocol specification:
+ * https://stremio.github.io/stremio-addon-sdk/protocol.html
+ * No third-party addon or SDK source code included.
+ */
+(function () {
+  'use strict';
+  var engine = window.LampaVideoFinder;
+  var L = window.Lampa;
+  if (!engine || !L || !engine.registerProvider || !engine.registerAction) {
+    console.warn('[VideoFinder] Load core v0.4 before stremio.js');
+    return;
+  }
+  if (window.LampaVideoFinderStremio) return;
+  var CATALOG_URL = 'https://raw.githubusercontent.com/Stremio/stremio-official-addons/master/index.json';
+  var STORAGE_KEY = 'video_finder_stremio_addons_v1';
+  var addons = [];
+
+  function notify(text, error) {
+    L.Noty.show(text, error ? { style: 'error', time: 5500 } : { time: 3500 });
+  }
+  function validHttp(raw, httpsOnly) {
+    try {
+      var value = String(raw || '').trim();
+      if (value.indexOf('stremio://') === 0) value = 'https://' + value.slice(10);
+      var url = new URL(value);
+      if ((httpsOnly && url.protocol !== 'https:') ||
+          (!httpsOnly && !/^https?:$/.test(url.protocol)) ||
+          url.username || url.password) return '';
+      return url.href;
+    } catch (_) { return ''; }
+  }
+  function manifestUrl(value) {
+    var url = validHttp(value, true);
+    if (!url) throw Error('Требуется HTTPS-адрес расширения');
+    var parsed = new URL(url);
+    if (parsed.hash || parsed.search) throw Error('Адрес должен оканчиваться на /manifest.json без параметров');
+    if (!/\/manifest\.json$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, '') + '/manifest.json';
+    }
+    return parsed.href;
+  }
+  function readSaved() {
+    try {
+      var raw = L.Storage && L.Storage.get(STORAGE_KEY, '[]');
+      var data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return Array.isArray(data) ? data.slice(0, 30) : [];
+    } catch (_) { return []; }
+  }
+  function save() {
+    if (L.Storage && L.Storage.set) {
+      L.Storage.set(STORAGE_KEY, JSON.stringify(addons.map(function (a) {
+        return { url: a.url, manifest: a.manifest };
+      })));
+    }
+  }
+  function short(value) {
+    return String(value || '').replace(/<[^>]+>/g, '').replace(/[\r\n\t]/g, ' ').trim().slice(0, 160);
+  }
+  function normalizeManifest(manifest) {
+    if (!manifest || !manifest.id || !manifest.name || !Array.isArray(manifest.types) ||
+        !Array.isArray(manifest.resources)) throw Error('Неправильный manifest.json');
+    if (manifest.behaviorHints && manifest.behaviorHints.configurationRequired) throw Error('Расширение требует настройки на своём сайте');
+    var resources = manifest.resources.filter(function (resource) {
+      return resource === 'stream' || (resource && resource.name === 'stream');
+    });
+    if (!resources.length) throw Error('Расширение не предоставляет потоки stream');
+    return {
+      id: short(manifest.id), name: short(manifest.name),
+      types: manifest.types.filter(function (v) { return v === 'movie' || v === 'series'; }),
+      idPrefixes: Array.isArray(manifest.idPrefixes) ? manifest.idPrefixes.filter(function (p) {
+        return typeof p === 'string' && p.length < 40;
+      }) : null,
+      resources: resources.map(function (r) {
+        return typeof r === 'string' ? 'stream' : {
+          name: 'stream',
+          types: Array.isArray(r.types) ? r.types.filter(function (t) { return t === 'movie' || t === 'series'; }) : null,
+          idPrefixes: Array.isArray(r.idPrefixes) ? r.idPrefixes.filter(function (p) {
+            return typeof p === 'string' && p.length < 40;
+          }) : null
+        };
+      })
+    };
+  }
+  function hash(text) {
+    var value = 2166136261;
+    for (var i = 0; i < text.length; i++) {
+      value ^= text.charCodeAt(i);
+      value = Math.imul(value, 16777619);
+    }
+    return (value >>> 0).toString(16);
+  }
+  function request(url) { return engine.requestJson(url); }
+
+  function episode(movie) {
+    var card = movie.card || {};
+    var season = Number(card.season_number || card.season || 0);
+    var number = Number(card.episode_number || card.episode || 0);
+    if (!Number.isInteger(season) || !Number.isInteger(number) || season < 1 || number < 1) return null;
+    return [season, number];
+  }
+  function idFor(addon, movie) {
+    var type = movie.media_type === 'tv' ? 'series' : 'movie';
+    var imdb = movie.imdb_id || (movie.card && movie.card.external_ids && movie.card.external_ids.imdb_id) || '';
+    var options = [];
+    if (/^tt\d{5,12}$/.test(String(imdb))) options.push(String(imdb));
+    if (movie.tmdb_id != null && /^\d+$/.test(String(movie.tmdb_id))) options.push('tmdb:' + String(movie.tmdb_id));
+    var resources = addon.manifest.resources;
+    for (var i = 0; i < resources.length; i++) {
+      var resource = resources[i];
+      var types = resource.types || addon.manifest.types;
+      if (types.indexOf(type) < 0) continue;
+      var prefixes = resource.idPrefixes || addon.manifest.idPrefixes;
+      for (var j = 0; j < options.length; j++) {
+        var id = options[j];
+        // Most addons without a prefix filter expect IMDb IDs. TMDB must be advertised explicitly.
+        if ((!prefixes && id.indexOf('tt') === 0) ||
+            (prefixes && prefixes.some(function (prefix) { return id.indexOf(prefix) === 0; }))) {
+          if (type === 'series') {
+            var ep = episode(movie);
+            return ep ? { type: type, id: id + ':' + ep[0] + ':' + ep[1] } : null;
+          }
+          return { type: type, id: id };
+        }
+      }
+    }
+    return null;
+  }
+  function endpoint(addon, key) {
+    return addon.url.slice(0, -'manifest.json'.length) + 'stream/' + key.type + '/' +
+      encodeURIComponent(key.id) + '.json';
+  }
+  function playable(stream) {
+    if (!stream || !stream.url || (stream.behaviorHints && stream.behaviorHints.proxyHeaders)) return '';
+    return validHttp(stream.url, false);
+  }
+  function playableStreams(data) {
+    return data && Array.isArray(data.streams) ? data.streams.filter(playable) : [];
+  }
+  function makeProvider(addon) {
+    return {
+      id: addon.providerId, name: 'Stremio · ' + addon.manifest.name,
+      siteUrl: addon.url, persistStreams: false, timeoutMs: 12000,
+      supports: function (movie) { return !!idFor(addon, movie); },
+      search: function (movie) {
+        var key = idFor(addon, movie);
+        if (!key) return Promise.resolve([]);
+        return request(endpoint(addon, key)).then(function (data) {
+          return playableStreams(data).slice(0, 25).map(function (stream, index) {
+            var title = short(stream.name || stream.description || stream.title || 'Видео');
+            return {
+              id: key.type + ':' + key.id + ':' + index,
+              signature: JSON.stringify([stream.name || '', stream.title || '', stream.description || '']), index: index, videoId: key.id, mediaType: key.type,
+              title: title, subtitle: short(stream.description || stream.title || 'Stremio'),
+              sourceUrl: addon.url, confidence: 90
+            };
+          });
+        });
+      },
+      resolve: function (item) {
+        if (!item || !/^(movie|series)$/.test(item.mediaType) || !item.videoId ||
+            !Number.isInteger(item.index) || item.index < 0 || item.index > 24) {
+          return Promise.reject(Error('Неправильная сохранённая запись'));
+        }
+        return request(endpoint(addon, { type: item.mediaType, id: item.videoId })).then(function (data) {
+          var streams = playableStreams(data);
+          var matches = streams.filter(function (stream) { return JSON.stringify([stream.name || '', stream.title || '', stream.description || '']) === item.signature; });
+          var selected = matches.length === 1 ? matches[0] : null;
+          if (!selected) return [];
+          return [{ title: short(selected.name || item.title || 'Видео'),
+            subtitle: short(selected.description || selected.title || 'Stremio'), url: selected.url }];
+        });
+      }
+    };
+  }
+  function addKnown(url, manifest) {
+    var normalized = manifestUrl(url);
+    var info = normalizeManifest(manifest);
+    var id = 'stremio:' + hash(normalized);
+    var old = addons.find(function (a) { return a.url === normalized; });
+    if (old) {
+      engine.unregisterProvider(old.providerId);
+      addons.splice(addons.indexOf(old), 1);
+    }
+    var addon = { url: normalized, manifest: info, providerId: id };
+    addons.push(addon);
+    engine.registerProvider(makeProvider(addon));
+    save();
+    return { id: id, name: info.name, url: normalized };
+  }
+  function install(url) {
+    var cleanUrl = manifestUrl(url);
+    return request(cleanUrl).then(function (manifest) { return addKnown(cleanUrl, manifest); });
+  }
+  function remove(id) {
+    var item = addons.find(function (a) { return a.providerId === id; });
+    if (!item) return false;
+    engine.unregisterProvider(item.providerId);
+    addons.splice(addons.indexOf(item), 1);
+    save();
+    return true;
+  }
+  function list() {
+    return addons.map(function (a) { return { id: a.providerId, name: a.manifest.name, url: a.url }; });
+  }
+  function addViaInput() {
+    if (!L.Input || typeof L.Input.edit !== 'function') {
+      notify('В этой версии Lampa нет поля ввода URL', true);
+      return;
+    }
+    L.Select.close();
+    L.Input.edit({ title: 'HTTPS-ссылка Stremio addon /manifest.json', value: '', free: true, nosave: true },
+      function (value) {
+        if (!value) return;
+        install(value).then(function (item) {
+          engine.clearCache(); notify('Добавлено: ' + item.name);
+          manage();
+        }).catch(function (err) { notify('Ошибка расширения: ' + err.message, true); });
+      });
+  }
+  function catalog() {
+    notify('Загружаю список Stremio...');
+    request(CATALOG_URL).then(function (data) {
+      if (!Array.isArray(data)) throw Error('Неправильный список');
+      var choices = data.filter(function (entry) {
+        var m = entry.manifest;
+        return m && /^https:\/\//.test(entry.transportUrl || '') &&
+          (m.resources || []).some(function (r) { return r === 'stream' || (r && r.name === 'stream'); });
+      }).map(function (entry) {
+        return { title: short(entry.manifest.name), subtitle: short(entry.manifest.description), url: entry.transportUrl };
+      });
+      if (!choices.length) { notify('В списке нет источников видео'); return; }
+      L.Select.show({title: 'Официальный список Stremio', items: choices,
+        onSelect: function (choice) {
+          install(choice.url).then(function (item) {
+            engine.clearCache(); notify('Добавлено: ' + item.name); manage();
+          }).catch(function (err) { notify('Не удалось добавить: ' + err.message, true); });
+        }, onBack: manage});
+    }).catch(function () { notify('Не удалось загрузить список. Можно добавить ссылку вручную.', true); manage(); });
+  }
+  function manage() {
+    var items = [{ title: 'Выбрать из списка Stremio', subtitle: 'Загрузить официальный список расширений', action: 'catalog' }, { title: '＋ Добавить расширение Stremio', subtitle: 'Адрес HTTPS /manifest.json', action: 'add' }];
+    list().forEach(function (addon) {
+      items.push({ title: addon.name, subtitle: addon.url + ' · нажмите для удаления', action: 'remove', addon: addon });
+    });
+    L.Select.show({ title: 'Stremio · расширения (' + addons.length + ')', items: items,
+      onSelect: function (choice) {
+        if (choice.action === 'catalog') return catalog();
+        if (choice.action === 'add') return addViaInput();
+        L.Select.show({ title: 'Удалить ' + choice.addon.name + '?',
+          items: [{ title: 'Нет, оставить', action: 'keep' },
+            { title: 'Удалить расширение', action: 'confirm' }],
+          onSelect: function (confirm) {
+            if (confirm.action === 'confirm') {
+              remove(choice.addon.id);
+              notify('Расширение удалено');
+            }
+            manage();
+          }, onBack: manage });
+      }, onBack: function () { L.Controller.toggle('content'); }
+    });
+  }
+  readSaved().forEach(function (addon) {
+    try { addKnown(addon.url, addon.manifest); }
+    catch (err) { console.warn('[VideoFinder] Ignore invalid saved Stremio addon'); }
+  });
+  window.LampaVideoFinderStremio = { install: install, remove: remove, list: list, manage: manage };
+  engine.registerAction({ id: 'stremio-manage', title: '⚙ Stremio · расширения',
+    subtitle: 'Добавить или удалить источник видео', open: manage });
+})();
+
 
