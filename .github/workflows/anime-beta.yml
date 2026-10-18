@@ -1,0 +1,22 @@
+name: PluginLampa Anime beta 0.6.3 tests
+on:
+  push:
+    paths:
+      - 'PluginLampa-anime-beta.js'
+      - 'tests/anime-beta-*.test.cjs'
+      - '.github/workflows/anime-beta.yml'
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check PluginLampa-anime-beta.js
+      - run: node tests/anime-beta-smoke.test.cjs
+      - run: node tests/anime-beta-stremio.test.cjs
+      - run: node tests/anime-beta-no-url.test.cjs
+      - run: node tests/anime-beta-source.test.cjs
+      - run: node tests/anime-beta-kb.test.cjs
