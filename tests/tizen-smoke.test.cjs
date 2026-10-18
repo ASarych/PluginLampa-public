@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const script = fs.readFileSync('PluginLampa-tizen.js', 'utf8');
-assert.match(script, /Lampa\.Manifest\.plugins/, 'Lampa's plugin checker expects Lampa.');
+assert.match(script, /Lampa\.Manifest\.plugins/, "Lampa plugin checker expects Lampa.");
 assert.doesNotMatch(script, /LampaVideoFinderStremio/);
 const events = { menus: [], played: [], notices: [], registrations: [], urls: [] };
 const storage = new Map();
