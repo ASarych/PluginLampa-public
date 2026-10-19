@@ -2105,6 +2105,11 @@ SOFTWARE.
     var navigation = ++resultsNavigationGeneration;
     if (!movie.title) {
       notify('В карточке нет названия фильма', true);
+      if (activeNativePage && activeNativePage.isAlive()) displayMenu({
+        title: 'PluginLampa · Ошибка',
+        items: [{title:'Нет названия фильма', subtitle:'Нажми Назад для возврата'}],
+        onSelect: function () {}, onBack: exitResults
+      });
       return;
     }
     var scope = titleSearch || 'all';
@@ -2244,8 +2249,12 @@ SOFTWARE.
         });
         // Never give the Tizen UI hundreds of rows at once. All candidates
         // remain accessible via pages without a new provider network call.
-        var entries = pageResults.concat(paging, menuActions, utilityEntries);
+        var nativeResults = !!(activeNativePage && activeNativePage.isAlive());
+        var entries = nativeResults
+          ? results.concat(menuActions, utilityEntries)
+          : pageResults.concat(paging, menuActions, utilityEntries);
         displayMenu({
+        _nativeGroupedResults: nativeResults,
         title: 'Видео · ' + movie.title +
           (networkCount === 0 ? ' · из памяти' : '') +
           (pages > 1 ? ' · ' + (resultPage + 1) + '/' + pages : ''),
@@ -2302,6 +2311,11 @@ SOFTWARE.
       if (navigation !== resultsNavigationGeneration) return;
       console.error('[VideoFinder] Unexpected search error', err);
       notify('Ошибка поиска видео', true);
+      if (activeNativePage && activeNativePage.isAlive()) displayMenu({
+        title: 'PluginLampa · Ошибка поиска',
+        items: [{title:'Не удалось получить результаты', subtitle:'Вернись к карточке и попробуй снова'}],
+        onSelect: function () {}, onBack: exitResults
+      });
     });
   }
 
@@ -2387,6 +2401,11 @@ SOFTWARE.
       return revision === movieLookupRevision && pageOwner === activeNativePage;
     }
     var movie = movieInfo(card);
+    // An invalid card has nothing to enrich; show its native error immediately.
+    if (!movie.title) {
+      if (current()) openResults(movie);
+      return;
+    }
     if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id ||
         typeof L.Api.sources.tmdb.external_imdb_id !== 'function') {
       if (current()) openResults(movie);
@@ -3183,10 +3202,22 @@ SOFTWARE.
     var content = jq('<div class="pluginlampa-native-page" style="padding:1.5em 2em 4em"></div>');
     var heading = jq('<div style="font-size:1.6em;margin-bottom:1em"></div>');
     var rows = jq('<div class="pluginlampa-native-rows"></div>');
+    var style = jq('<style>' +
+      '.pluginlampa-native-page{padding:1.3em 2em 4em}' +
+      '.pluginlampa-native-page .online{margin-bottom:.45em}' +
+      '.pluginlampa-native-page .online__body{padding:.9em 1.1em}' +
+      '.pluginlampa-native-page .pluginlampa-selected .online__body{' +
+      'background:rgba(255,255,255,.22);outline:.17em solid #fff;' +
+      'border-radius:.3em}' +
+      '.pluginlampa-native-page .pluginlampa-section{' +
+      'font-weight:bold;font-size:1.12em;opacity:.85;padding:.85em 0 .35em}' +
+      '</style>');
     var selected = null;
-    var focusMemory = {};
+    var visibleRows = [];
+    var focusMemory = Object.create(null);
     var selectedIndex = 0;
     var menu = null;
+    var chosenSource = null;
     var page = 0;
     var generation = 0;
     var alive = true;
@@ -3207,6 +3238,17 @@ SOFTWARE.
       L.Controller.collectionFocus(selected || false, scroll.render());
     }
 
+    function moveFallback(delta) {
+      if (!isActive() || !visibleRows.length) return;
+      var index = 0;
+      for (var i = 0; i < visibleRows.length; i++) {
+        if (visibleRows[i].node === selected) { index = i; break; }
+      }
+      index = Math.max(0, Math.min(visibleRows.length - 1, index + delta));
+      visibleRows[index].focus();
+      setFocus();
+    }
+
     function draw() {
       if (!alive || !menu) return;
       generation++;
@@ -3214,51 +3256,75 @@ SOFTWARE.
       var list = Array.isArray(menu.items) ? menu.items : [];
       var maxPage = Math.max(0, Math.ceil(list.length / MAX_ROWS) - 1);
       page = Math.max(0, Math.min(page, maxPage));
+      selectedIndex = Math.max(page * MAX_ROWS,
+        Math.min(selectedIndex, Math.max(0, list.length - 1)));
+      if (Math.floor(selectedIndex / MAX_ROWS) !== page) selectedIndex = page * MAX_ROWS;
       heading.text(menu.title || 'PluginLampa');
       rows.empty();
+      visibleRows = [];
       selected = null;
       var firstRow = null;
       var restoredRow = null;
       var view = list.slice(page * MAX_ROWS, page * MAX_ROWS + MAX_ROWS);
+      var lastSource = null;
       var actions = [];
       if (page > 0) actions.push({title:'← Предыдущие', _nativeBackPage:true});
       if (page < maxPage) actions.push({title:'Следующие →', _nativeNextPage:true});
       view.concat(actions).forEach(function (item, localIndex) {
-        var row = jq('<div class="selector pluginlampa-native-item" ' +
-          'style="margin:.4em 0;padding:.85em 1em;border-radius:.4em;' +
-          'background:rgba(255,255,255,.08)"></div>');
-        var title = jq('<div style="font-size:1.15em"></div>');
-        var subtitle = jq('<div style="opacity:.65;margin-top:.2em;font-size:.9em"></div>');
+        var sourceName = item && item._provider ? item._provider.name : null;
+        if (sourceName && sourceName !== lastSource) {
+          var section = jq('<div class="pluginlampa-section"></div>');
+          section.text(sourceName);
+          rows.append(section);
+        }
+        lastSource = sourceName;
+        var row = jq('<div class="online selector pluginlampa-native-item"></div>');
+        var body = jq('<div class="online__body"></div>');
+        var title = jq('<div class="online__title"></div>');
+        var subtitle = jq('<div class="online__quality"></div>');
         title.text(String(item && item.title != null ? item.title : 'Видео'));
         subtitle.text(String(item && item.subtitle != null ? item.subtitle : ''));
-        row.append(title);
-        row.append(subtitle);
+        body.append(title);
+        body.append(subtitle);
+        row.append(body);
         row.on('hover:enter', function () {
           if (!alive || token !== generation || !isActive()) return;
+          // Some remote implementations send OK without a preceding focus event.
+          if (!item._nativeNextPage && !item._nativeBackPage) {
+            selectedIndex = page * MAX_ROWS + localIndex;
+            focusMemory[menu.title || 'PluginLampa'] = selectedIndex;
+          }
           if (item._nativeNextPage) {
             page++;
+            selectedIndex = page * MAX_ROWS;
             draw();
           } else if (item._nativeBackPage) {
             page--;
+            selectedIndex = page * MAX_ROWS;
             draw();
           } else if (menu && typeof menu.onSelect === 'function') {
             menu.onSelect(item);
           }
         });
-        row.on('hover:focus', function () {
+        var focusRow = function () {
           if (!alive || token !== generation || !isActive()) return;
+          if (selected && selected !== row[0]) jq(selected).removeClass('pluginlampa-selected');
           selected = row[0];
+          row.addClass('pluginlampa-selected');
           if (menu && !item._nativeNextPage && !item._nativeBackPage) {
             selectedIndex = page * MAX_ROWS + localIndex;
             focusMemory[menu.title || 'PluginLampa'] = selectedIndex;
           }
           if (typeof scroll.update === 'function') scroll.update(row, true);
-        });
+        };
+        row.on('hover:focus', focusRow);
+        visibleRows.push({node: row[0], focus: focusRow});
         if (!firstRow) firstRow = row[0];
         if (localIndex === selectedIndex - page * MAX_ROWS) restoredRow = row[0];
         rows.append(row);
       });
       selected = restoredRow || firstRow;
+      if (selected) jq(selected).addClass('pluginlampa-selected');
       if (!list.length) {
         var empty = jq('<div style="opacity:.7;padding:1em"></div>');
         empty.text('Список пуст');
@@ -3269,16 +3335,90 @@ SOFTWARE.
       }
     }
 
-    this.isAlive = function () { return alive; };
-    this.showMenu = function (next) {
-      if (!alive) return;
+    function sourceMenu(root, id) {
+      var rowsForSource = root.items.filter(function (item) {
+        return item && item._provider && item._provider.id === id;
+      });
+      var first = rowsForSource[0];
+      var label = first && first._provider ? first._provider.name : id;
+      return {
+        title: 'PluginLampa · ' + label,
+        items: rowsForSource,
+        onSelect: function (item) {
+          if (!alive || !isActive()) return;
+          root.onSelect(item);
+        },
+        onBack: function () {
+          chosenSource = null;
+          self.showMenu(root);
+        }
+      };
+    }
+
+    function sourceChooser(root) {
+      var providers = [];
+      var counts = Object.create(null);
+      var labels = Object.create(null);
+      var commands = [];
+      root.items.forEach(function (item) {
+        if (item && item._provider && item._provider.id) {
+          var id = item._provider.id;
+          if (!counts[id]) {
+            counts[id] = 0;
+            providers.push(id);
+            labels[id] = item._provider.name || id;
+          }
+          counts[id]++;
+        } else commands.push(item);
+      });
+      var choices = providers.map(function (id) {
+        return {
+          title: labels[id], subtitle: counts[id] + ' результатов · открыть источник',
+          _nativeSource: id
+        };
+      });
+      // Show explicit empty state instead of an unexplained command-only screen.
+      if (!choices.length) choices.push({
+        title: 'Источники ничего не нашли',
+        subtitle: 'Проверь диагностику или обнови поиск',
+        _nativeEmpty: true
+      });
+      choices = choices.concat(commands);
+      return {
+        title: root.title + ' · Источники',
+        items: choices,
+        onSelect: function (item) {
+          if (!alive || !isActive()) return;
+          if (item._nativeEmpty) return;
+          if (item._nativeSource) {
+            chosenSource = item._nativeSource;
+            renderMenu(sourceMenu(root, chosenSource));
+          } else root.onSelect(item);
+        },
+        onBack: function () { L.Activity.backward(); }
+      };
+    }
+
+    function renderMenu(next) {
       menu = next || {title:'PluginLampa',items:[]};
       selectedIndex = focusMemory[menu.title || 'PluginLampa'] || 0;
       page = Math.floor(selectedIndex / MAX_ROWS);
       draw();
+    }
+
+    this.isAlive = function () { return alive; };
+    this.showMenu = function (next) {
+      if (!alive) return;
+      if (next && next._nativeGroupedResults) {
+        if (chosenSource && !next.items.some(function (item) {
+          return item && item._provider && item._provider.id === chosenSource;
+        })) chosenSource = null;
+        renderMenu(chosenSource ? sourceMenu(next, chosenSource) : sourceChooser(next));
+      } else renderMenu(next);
     };
 
     this.create = function () {
+      content.append(style);
       content.append(heading);
       content.append(rows);
       scroll.append(content);
@@ -3310,18 +3450,21 @@ SOFTWARE.
       L.Controller.add('content', {
         toggle: function () { setFocus(); },
         left: function () {
-          if (window.Navigator && window.Navigator.canmove('left')) window.Navigator.move('left');
+          if (window.Navigator && typeof window.Navigator.canmove === 'function' &&
+              typeof window.Navigator.move === 'function' && window.Navigator.canmove('left')) window.Navigator.move('left');
           else L.Controller.toggle('menu');
         },
         right: function () {
-          if (window.Navigator) window.Navigator.move('right');
+          if (window.Navigator && typeof window.Navigator.move === 'function') window.Navigator.move('right');
         },
         up: function () {
-          if (window.Navigator && window.Navigator.canmove('up')) window.Navigator.move('up');
-          else L.Controller.toggle('head');
+          if (window.Navigator && typeof window.Navigator.canmove === 'function' &&
+              typeof window.Navigator.move === 'function' && window.Navigator.canmove('up')) window.Navigator.move('up');
+          else moveFallback(-1);
         },
         down: function () {
-          if (window.Navigator) window.Navigator.move('down');
+          if (window.Navigator && typeof window.Navigator.move === 'function') window.Navigator.move('down');
+          else moveFallback(1);
         },
         back: function () { self.back(); }
       });
@@ -3333,12 +3476,8 @@ SOFTWARE.
     };
 
     this.back = function () {
-      if (!alive) return;
-      if (page > 0) {
-        page--;
-        draw();
-        return;
-      }
+      // A paused Activity must not consume Back destined for the top screen.
+      if (!alive || !isActive()) return;
       if (menu && typeof menu.onBack === 'function') {
         menu.onBack();
       } else L.Activity.backward();
@@ -3355,6 +3494,7 @@ SOFTWARE.
       if (typeof scroll.destroy === 'function') scroll.destroy();
       content.remove();
       menu = null;
+      visibleRows = [];
       selected = null;
     };
   }
