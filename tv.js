@@ -1,1248 +1,3 @@
-// PluginLampa v0.6.3 · Archive + Rutube + Stremio + AniLiberty + KB.
-(function () {
-  if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
-/*
- * observations alternative (a): a bounded ring buffer of raw events whose
- * aggregates are computed on read. Conforms to kb/observations/CONTRACT.md.
- *
- * createStore(storage, opts) -> { append, recent, aggregate, exportAll, importAll, size }
- *
- * Append-only journal, whitelisted event fields, sanitized URLs (no tokens or
- * Stremio query params), one-JSON export/import, in-memory degradation when the
- * storage adapter is missing or broken. No external dependencies. Works both in
- * Node (module.exports) and in the browser (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  var DEFAULT_KEY = 'video_finder_kb_observations_v1';
-  var DEFAULT_MAX_EVENTS = 500;
-  var DETAIL_MAX = 200;
-
-  var CLASSES = [
-    'FOUND', 'EMPTY', 'INCOMPATIBLE_FORMAT', 'API_ERROR', 'CORS_BLOCKED',
-    'SERVER_DOWN', 'TIMEOUT', 'REGION_BLOCKED', 'AUTH_REQUIRED', 'UNCLASSIFIED'
-  ];
-
-  var CLASS_SET = {};
-  for (var ci = 0; ci < CLASSES.length; ci += 1) CLASS_SET[CLASSES[ci]] = true;
-
-  var TOKEN_SEGMENT = /^[A-Za-z0-9_-]+$/;
-  var URL_IN_TEXT = /https?:\/\/[^\s]*/gi;
-
-  function hasOwn(obj, key) {
-    return Object.prototype.hasOwnProperty.call(obj, key);
-  }
-
-  function isFiniteNumber(value) {
-    return typeof value === 'number' && isFinite(value);
-  }
-
-  function isPositiveInteger(value) {
-    return isFiniteNumber(value) && value > 0 && Math.floor(value) === value;
-  }
-
-  function isKnownClass(value) {
-    return typeof value === 'string' && hasOwn(CLASS_SET, value);
-  }
-
-  /* ----------------------------------------------------------- sanitizing */
-
-  function parseUrl(raw) {
-    if (typeof URL === 'function') {
-      try {
-        var parsed = new URL(raw);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-        return { origin: parsed.origin, pathname: parsed.pathname };
-      } catch (ignore) {
-        return null;
-      }
-    }
-    var match = /^(https?):\/\/([^\/?#]+)([^?#]*)/i.exec(raw);
-    if (!match) return null;
-    var authority = match[2];
-    var at = authority.lastIndexOf('@');
-    if (at >= 0) authority = authority.slice(at + 1);
-    if (authority.length === 0) return null;
-    var pathname = match[3] && match[3].length > 0 ? match[3] : '/';
-    return { origin: match[1].toLowerCase() + '://' + authority, pathname: pathname };
-  }
-
-  function sanitizePath(pathname) {
-    var segments = pathname.split('/');
-    for (var i = 0; i < segments.length; i += 1) {
-      if (segments[i].length >= 20 && TOKEN_SEGMENT.test(segments[i])) segments[i] = '<token>';
-    }
-    return segments.join('/');
-  }
-
-  function sanitizeUrl(raw) {
-    if (typeof raw !== 'string' || raw.length === 0) return null;
-    var parsed = parseUrl(raw);
-    if (!parsed) return null;
-    return parsed.origin + sanitizePath(parsed.pathname);
-  }
-
-  function sanitizeDetail(text) {
-    if (typeof text !== 'string' || text.length === 0) return null;
-    var collapsed = text.replace(/[\r\n\t]+/g, ' ');
-    var masked = collapsed.replace(URL_IN_TEXT, function (match) {
-      var safe = sanitizeUrl(match);
-      return safe === null ? '' : safe;
-    });
-    return masked.length > DETAIL_MAX ? masked.slice(0, DETAIL_MAX) : masked;
-  }
-
-  /* --------------------------------------------------------------- events */
-
-  function buildEvent(input, nowFn) {
-    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-      throw new Error('observation event must be an object');
-    }
-    if (typeof input.sourceId !== 'string' || input.sourceId.length === 0) {
-      throw new Error('observation event requires a non-empty sourceId');
-    }
-    if (!isKnownClass(input.class)) {
-      throw new Error('observation event has an unknown class');
-    }
-    var time;
-    if (hasOwn(input, 'time') && input.time !== undefined) {
-      if (!isFiniteNumber(input.time)) {
-        throw new Error('observation event time must be a finite number');
-      }
-      time = input.time;
-    } else {
-      time = nowFn();
-    }
-    return {
-      time: time,
-      sourceId: input.sourceId,
-      class: input.class,
-      movieId: typeof input.movieId === 'string' ? input.movieId : null,
-      method: typeof input.method === 'string' ? input.method : null,
-      route: sanitizeUrl(input.route),
-      detail: sanitizeDetail(input.detail)
-    };
-  }
-
-  function copyEvent(event) {
-    return {
-      time: event.time,
-      sourceId: event.sourceId,
-      class: event.class,
-      movieId: event.movieId,
-      method: event.method,
-      route: event.route,
-      detail: event.detail
-    };
-  }
-
-  function buildStored(input, nowFn, strict) {
-    if (!strict) {
-      try {
-        return buildEvent(input, nowFn);
-      } catch (ignore) {
-        return null;
-      }
-    }
-    return buildEvent(input, nowFn);
-  }
-
-  /* -------------------------------------------------------------- storage */
-
-  function safeGet(storage, key) {
-    if (!storage || typeof storage.get !== 'function') return undefined;
-    try {
-      return storage.get(key, undefined);
-    } catch (ignore) {
-      return undefined;
-    }
-  }
-
-  function safeSet(storage, key, value) {
-    if (!storage || typeof storage.set !== 'function') return;
-    try {
-      storage.set(key, value);
-    } catch (ignore) {
-      /* degradation: memory only */
-    }
-  }
-
-  function decode(raw) {
-    if (raw === null || raw === undefined) return null;
-    if (typeof raw === 'string') {
-      if (raw.length === 0) return null;
-      try {
-        return JSON.parse(raw);
-      } catch (ignore) {
-        return null;
-      }
-    }
-    return typeof raw === 'object' ? raw : null;
-  }
-
-  function loadEvents(storage, key, maxEvents, nowFn) {
-    var data = decode(safeGet(storage, key));
-    if (!data || !Array.isArray(data.events)) return [];
-    var restored = [];
-    for (var i = 0; i < data.events.length; i += 1) {
-      var event = buildStored(data.events[i], nowFn, false);
-      if (event) restored.push(event);
-    }
-    return restored.length > maxEvents ? restored.slice(restored.length - maxEvents) : restored;
-  }
-
-  /* ------------------------------------------------------------ selection */
-
-  function readFilter(opts) {
-    var filter = { limit: null };
-    if (isFiniteNumber(opts) && opts >= 0) {
-      filter.limit = Math.floor(opts);
-      return filter;
-    }
-    if (opts && typeof opts === 'object') {
-      if (typeof opts.sourceId === 'string') filter.sourceId = opts.sourceId;
-      if (typeof opts.movieId === 'string') filter.movieId = opts.movieId;
-      if (typeof opts.class === 'string') filter.class = opts.class;
-      if (isFiniteNumber(opts.since)) filter.since = opts.since;
-      if (isFiniteNumber(opts.limit) && opts.limit >= 0) filter.limit = Math.floor(opts.limit);
-    }
-    return filter;
-  }
-
-  function matches(event, filter) {
-    if (hasOwn(filter, 'sourceId') && event.sourceId !== filter.sourceId) return false;
-    if (hasOwn(filter, 'movieId') && event.movieId !== filter.movieId) return false;
-    if (hasOwn(filter, 'class') && event.class !== filter.class) return false;
-    if (hasOwn(filter, 'since') && !(event.time >= filter.since)) return false;
-    return true;
-  }
-
-  /* --------------------------------------------------------------- create */
-
-  function createStore(storage, opts) {
-    var options = opts && typeof opts === 'object' ? opts : {};
-    var key = typeof options.key === 'string' && options.key.length > 0 ? options.key : DEFAULT_KEY;
-    var maxEvents = isPositiveInteger(options.maxEvents) ? options.maxEvents : DEFAULT_MAX_EVENTS;
-    var nowFn = typeof options.now === 'function' ? options.now : function () { return Date.now(); };
-
-    var events = loadEvents(storage, key, maxEvents, nowFn);
-
-    function persist() {
-      safeSet(storage, key, JSON.stringify({ version: 1, events: events }));
-    }
-
-    function append(input) {
-      var event = buildEvent(input, nowFn);
-      events.push(event);
-      if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
-      persist();
-    }
-
-    function recent(opts2) {
-      var filter = readFilter(opts2);
-      var selected = [];
-      for (var i = 0; i < events.length; i += 1) {
-        if (matches(events[i], filter)) selected.push(copyEvent(events[i]));
-      }
-      if (filter.limit !== null && selected.length > filter.limit) {
-        selected = selected.slice(selected.length - filter.limit);
-      }
-      return selected;
-    }
-
-    function aggregate(opts2) {
-      var since = opts2 && typeof opts2 === 'object' && isFiniteNumber(opts2.since) ? opts2.since : null;
-      var total = 0;
-      var sources = Object.create(null);
-      for (var i = 0; i < events.length; i += 1) {
-        var event = events[i];
-        if (since !== null && !(event.time >= since)) continue;
-        total += 1;
-        var source = sources[event.sourceId];
-        if (!source) {
-          source = { total: 0, byClass: Object.create(null), lastOk: null, lastFail: null, lastTime: null };
-          sources[event.sourceId] = source;
-        }
-        source.total += 1;
-        source.byClass[event.class] = (source.byClass[event.class] || 0) + 1;
-        if (event.class === 'FOUND') {
-          if (source.lastOk === null || event.time >= source.lastOk) source.lastOk = event.time;
-        } else if (source.lastFail === null || event.time >= source.lastFail) {
-          source.lastFail = event.time;
-        }
-        if (source.lastTime === null || event.time >= source.lastTime) source.lastTime = event.time;
-      }
-      return { total: total, sources: sources };
-    }
-
-    function exportAll() {
-      var out = [];
-      for (var i = 0; i < events.length; i += 1) out.push(copyEvent(events[i]));
-      return JSON.stringify({ version: 1, events: out });
-    }
-
-    function importAll(json) {
-      var data;
-      if (typeof json === 'string') {
-        try {
-          data = JSON.parse(json);
-        } catch (ignore) {
-          throw new Error('importAll: invalid JSON');
-        }
-      } else if (json && typeof json === 'object') {
-        data = json;
-      } else {
-        throw new Error('importAll: expected a JSON string or object');
-      }
-      if (!data || data.version !== 1 || !Array.isArray(data.events)) {
-        throw new Error('importAll: expected { version: 1, events: [] }');
-      }
-      var next = [];
-      for (var i = 0; i < data.events.length; i += 1) {
-        next.push(buildStored(data.events[i], nowFn, true));
-      }
-      if (next.length > maxEvents) next = next.slice(next.length - maxEvents);
-      events = next;
-      persist();
-    }
-
-    function size() {
-      return events.length;
-    }
-
-    return {
-      append: append,
-      recent: recent,
-      aggregate: aggregate,
-      exportAll: exportAll,
-      importAll: importAll,
-      size: size
-    };
-  }
-
-  var api = { createStore: createStore };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.observations = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * outcomes alternative (a): a rules table over HTTP status, error name/code
- * and exception text. Conforms to kb/outcomes/CONTRACT.md.
- *
- * classify(err, ctx) -> { class, retryable, detail }
- *
- * Pure, never throws, no external dependencies. Works both in Node
- * (module.exports) and in the browser (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  /* ------------------------------------------------------------- kind table */
-
-  var KIND_RULES = {
-    found: 'FOUND',
-    empty: 'EMPTY',
-    not_found: 'EMPTY',
-    no_results: 'EMPTY',
-    incompatible_format: 'INCOMPATIBLE_FORMAT',
-    format: 'INCOMPATIBLE_FORMAT',
-    parse_error: 'INCOMPATIBLE_FORMAT',
-    bad_format: 'INCOMPATIBLE_FORMAT',
-    schema_mismatch: 'INCOMPATIBLE_FORMAT',
-    api_error: 'API_ERROR',
-    api: 'API_ERROR',
-    http_error: 'API_ERROR',
-    upstream_error: 'API_ERROR',
-    rate_limited: 'API_ERROR',
-    cors: 'CORS_BLOCKED',
-    cors_blocked: 'CORS_BLOCKED',
-    blocked: 'CORS_BLOCKED',
-    server_down: 'SERVER_DOWN',
-    server_error: 'SERVER_DOWN',
-    unavailable: 'SERVER_DOWN',
-    connection_refused: 'SERVER_DOWN',
-    network: 'SERVER_DOWN',
-    timeout: 'TIMEOUT',
-    timed_out: 'TIMEOUT',
-    region_blocked: 'REGION_BLOCKED',
-    geo_blocked: 'REGION_BLOCKED',
-    region: 'REGION_BLOCKED',
-    not_available: 'REGION_BLOCKED',
-    auth_required: 'AUTH_REQUIRED',
-    unauthorized: 'AUTH_REQUIRED',
-    forbidden: 'AUTH_REQUIRED',
-    auth: 'AUTH_REQUIRED',
-    login_required: 'AUTH_REQUIRED',
-    token_invalid: 'AUTH_REQUIRED',
-    unclassified: 'UNCLASSIFIED',
-    unknown: 'UNCLASSIFIED'
-  };
-
-  /* -------------------------------------------------------------- err codes */
-
-  var TIMEOUT_CODES = { ETIMEDOUT: true, ESOCKETTIMEDOUT: true, ETIMEOUT: true };
-  var NETWORK_CODES = {
-    ECONNREFUSED: true, ECONNRESET: true, EHOSTUNREACH: true,
-    ENETUNREACH: true, ENOTFOUND: true, EAI_AGAIN: true
-  };
-  var TIMEOUT_NAMES = { AbortError: true, TimeoutError: true };
-
-  /* ------------------------------------------------------------- text table */
-
-  var CORS_PATTERNS = ['cors', 'cross-origin'];
-  var REGION_PATTERNS = ['region', 'geo', 'country', 'not available in your'];
-  var AUTH_PATTERNS = ['unauthori', 'forbidden', 'auth', 'api key', 'invalid token', 'login'];
-  var FORMAT_PATTERNS = ['parse', 'format', 'unexpected token', 'invalid json', 'schema'];
-  var TIMEOUT_PATTERNS = ['timed out', 'timeout'];
-  var NETWORK_PATTERNS = [
-    'enotfound', 'econnrefused', 'econnreset', 'network', 'failed to fetch',
-    'fetch failed', 'socket hang up', 'offline', 'unreachable'
-  ];
-  var API_PATTERNS = ['api error', 'bad request'];
-
-  var TEXT_RULES = [
-    { cls: 'CORS_BLOCKED', patterns: CORS_PATTERNS },
-    { cls: 'REGION_BLOCKED', patterns: REGION_PATTERNS },
-    { cls: 'AUTH_REQUIRED', patterns: AUTH_PATTERNS },
-    { cls: 'INCOMPATIBLE_FORMAT', patterns: FORMAT_PATTERNS },
-    { cls: 'TIMEOUT', patterns: TIMEOUT_PATTERNS },
-    { cls: 'SERVER_DOWN', patterns: NETWORK_PATTERNS },
-    { cls: 'API_ERROR', patterns: API_PATTERNS }
-  ];
-
-  /* ---------------------------------------------------------------- helpers */
-
-  function hasOwn(map, key) {
-    return Object.prototype.hasOwnProperty.call(map, key);
-  }
-
-  function read(obj, key) {
-    if (obj === null || obj === undefined) return undefined;
-    try { return obj[key]; } catch (ignore) { return undefined; }
-  }
-
-  function result(cls, detail) {
-    return {
-      class: cls,
-      retryable: cls !== 'FOUND' && cls !== 'EMPTY',
-      detail: typeof detail === 'string' && detail.length > 0 ? detail : cls.toLowerCase()
-    };
-  }
-
-  function textOf(err) {
-    if (typeof err === 'string') return err;
-    if (err !== null && typeof err === 'object') {
-      var message = read(err, 'message');
-      if (typeof message === 'string') return message;
-    }
-    return '';
-  }
-
-  function normalizeToken(value) {
-    if (typeof value !== 'string') return null;
-    var token = value.trim().toLowerCase();
-    return token.length > 0 ? token : null;
-  }
-
-  function normalizeCode(value) {
-    if (typeof value !== 'string') return null;
-    var code = value.trim().toUpperCase();
-    return code.length > 0 ? code : null;
-  }
-
-  function kindClass(value) {
-    var token = normalizeToken(value);
-    if (token && hasOwn(KIND_RULES, token)) return KIND_RULES[token];
-    return null;
-  }
-
-  function matchesAny(text, patterns) {
-    if (typeof text !== 'string' || text.length === 0) return false;
-    var lower = text.toLowerCase();
-    for (var i = 0; i < patterns.length; i += 1) {
-      if (lower.indexOf(patterns[i]) !== -1) return true;
-    }
-    return false;
-  }
-
-  function textClass(text) {
-    for (var i = 0; i < TEXT_RULES.length; i += 1) {
-      if (matchesAny(text, TEXT_RULES[i].patterns)) return TEXT_RULES[i].cls;
-    }
-    return null;
-  }
-
-  function isPositiveInteger(value) {
-    return typeof value === 'number' && isFinite(value) && value > 0 && Math.floor(value) === value;
-  }
-
-  function statusClass(status, text) {
-    if (status === 401) return 'AUTH_REQUIRED';
-    if (status === 403) {
-      if (matchesAny(text, REGION_PATTERNS)) return 'REGION_BLOCKED';
-      if (matchesAny(text, CORS_PATTERNS)) return 'CORS_BLOCKED';
-      return 'AUTH_REQUIRED';
-    }
-    if (status === 408) return 'TIMEOUT';
-    if (status === 429) return 'API_ERROR';
-    if (status === 451) return 'REGION_BLOCKED';
-    if (status >= 400 && status <= 499) return 'API_ERROR';
-    if (status >= 500 && status <= 599) return 'SERVER_DOWN';
-    return null;
-  }
-
-  function pickStatus(err, ctx) {
-    var errCandidates = [
-      read(err, 'status'),
-      read(err, 'statusCode'),
-      read(read(err, 'response'), 'status'),
-      read(err, 'httpStatus')
-    ];
-    for (var i = 0; i < errCandidates.length; i += 1) {
-      if (isPositiveInteger(errCandidates[i])) return errCandidates[i];
-    }
-    var ctxCandidates = [read(ctx, 'httpStatus'), read(ctx, 'status')];
-    for (var j = 0; j < ctxCandidates.length; j += 1) {
-      if (isPositiveInteger(ctxCandidates[j])) return ctxCandidates[j];
-    }
-    return undefined;
-  }
-
-  /* -------------------------------------------------------- classification */
-
-  function classifyFromErr(err, ctx) {
-    var text = textOf(err);
-
-    var byKind = kindClass(read(err, 'kind'));
-    if (byKind) return result(byKind, 'typed marker');
-
-    var status = pickStatus(err, ctx);
-    if (status !== undefined) {
-      var byStatus = statusClass(status, text);
-      if (byStatus) return result(byStatus, 'http status ' + status);
-    }
-
-    var code = normalizeCode(read(err, 'code'));
-    if (code && hasOwn(TIMEOUT_CODES, code)) return result('TIMEOUT', 'error code ' + code);
-    if (code && hasOwn(NETWORK_CODES, code)) return result('SERVER_DOWN', 'error code ' + code);
-
-    var name = read(err, 'name');
-    if (typeof name === 'string' && hasOwn(TIMEOUT_NAMES, name)) return result('TIMEOUT', 'error name ' + name);
-
-    var byText = textClass(text);
-    if (byText) return result(byText, 'message pattern');
-
-    return result('UNCLASSIFIED', 'unrecognised exception');
-  }
-
-  function classifyFromCtx(ctx) {
-    var outcome = read(ctx, 'outcome');
-    var found = read(ctx, 'found');
-    var count = read(ctx, 'resultCount');
-    var items = read(ctx, 'items');
-    var results = read(ctx, 'results');
-
-    if (outcome === 'found' || found === true ||
-        (typeof count === 'number' && isFinite(count) && count > 0) ||
-        (Array.isArray(items) && items.length > 0) ||
-        (Array.isArray(results) && results.length > 0)) {
-      return result('FOUND', 'ctx signals: found');
-    }
-    if (outcome === 'empty' || read(ctx, 'empty') === true ||
-        (typeof count === 'number' && count === 0)) {
-      return result('EMPTY', 'ctx signals: empty');
-    }
-    return result('UNCLASSIFIED', 'ctx signals: unrecognised');
-  }
-
-  function classify(err, ctx) {
-    try {
-      if (err === null || err === undefined) return classifyFromCtx(ctx);
-      return classifyFromErr(err, ctx);
-    } catch (ignore) {
-      return result('UNCLASSIFIED', 'classification failure');
-    }
-  }
-
-  var api = { classify: classify };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.outcomes = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * profile alternative (b): a class-weighted score with exponential decay,
- * computed only from the observation journal. Conforms to kb/profile/CONTRACT.md.
- *
- * profile(store, sourceId, now) -> { score, state, lastOk, bestMethod }
- *
- * The score is the share of positive (FOUND) weight among all weighted
- * meaningful observations, where each observation's weight decays with age
- * (half-life). EMPTY is a successful request without finds: it is treated as
- * neutral and excluded from the score, so it can never worsen a profile.
- * Every failure class weighs strictly more than EMPTY and weights differ by
- * class, so a persistent failure counts more than a transient one.
- *
- * Pure, deterministic for an injected `now`, no external dependencies.
- * Works both in Node (module.exports) and in the browser
- * (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  var DAY_MS = 24 * 60 * 60 * 1000;
-  var HALF_LIFE_MS = 7 * DAY_MS;
-  var RECENT_LIMIT = 500;
-
-  var FOUND = 'FOUND';
-  var EMPTY = 'EMPTY';
-
-  /* Failure severity weights. All are strictly greater than EMPTY (weight 0). */
-  var FAILURE_WEIGHT = {
-    TIMEOUT: 1,
-    API_ERROR: 1,
-    UNCLASSIFIED: 1.5,
-    SERVER_DOWN: 2,
-    AUTH_REQUIRED: 2.5,
-    REGION_BLOCKED: 3,
-    CORS_BLOCKED: 3,
-    INCOMPATIBLE_FORMAT: 3
-  };
-
-  var NEUTRAL = { score: 0, state: 'unknown', lastOk: null, bestMethod: null };
-
-  function isFiniteNumber(value) {
-    return typeof value === 'number' && isFinite(value);
-  }
-
-  function classOf(obs) {
-    if (obs && typeof obs.class === 'string') return obs.class;
-    if (obs && typeof obs.outcome === 'string') return obs.outcome;
-    return '';
-  }
-
-  function atOf(obs) {
-    if (obs && isFiniteNumber(obs.at)) return obs.at;
-    if (obs && isFiniteNumber(obs.ts)) return obs.ts;
-    return null;
-  }
-
-  function methodOf(obs) {
-    return obs && typeof obs.method === 'string' ? obs.method : '';
-  }
-
-  function readJournal(store, sourceId) {
-    if (!store || typeof store.recent !== 'function') return [];
-    var list;
-    try {
-      list = store.recent(sourceId, RECENT_LIMIT);
-    } catch (err) {
-      return [];
-    }
-    return Array.isArray(list) ? list : [];
-  }
-
-  function decayFactor(now, at) {
-    var age = now - at;
-    if (age <= 0) return 1;
-    return Math.pow(0.5, age / HALF_LIFE_MS);
-  }
-
-  function profile(store, sourceId, now) {
-    var clock = isFiniteNumber(now) ? now : 0;
-    var journal = readJournal(store, sourceId);
-
-    var positive = 0;
-    var negative = 0;
-    var foundCount = 0;
-    var failureCount = 0;
-    var lastOk = null;
-    var methods = {};
-
-    for (var i = 0; i < journal.length; i++) {
-      var obs = journal[i];
-      if (!obs || typeof obs !== 'object') continue;
-      var at = atOf(obs);
-      if (at === null || at > clock) continue;
-
-      var weight = decayFactor(clock, at);
-      var cls = classOf(obs);
-
-      if (cls === FOUND) {
-        foundCount++;
-        positive += weight;
-        if (lastOk === null || at > lastOk) lastOk = at;
-        var name = methodOf(obs);
-        if (name) {
-          var entry = methods[name];
-          if (!entry) {
-            entry = { count: 0, lastAt: -Infinity };
-            methods[name] = entry;
-          }
-          entry.count++;
-          if (at > entry.lastAt) entry.lastAt = at;
-        }
-      } else if (cls === EMPTY) {
-        continue;
-      } else {
-        failureCount++;
-        var severity = Object.prototype.hasOwnProperty.call(FAILURE_WEIGHT, cls)
-          ? FAILURE_WEIGHT[cls]
-          : FAILURE_WEIGHT.UNCLASSIFIED;
-        negative += severity * weight;
-      }
-    }
-
-    if (foundCount === 0 && failureCount === 0) {
-      return { score: 0, state: 'unknown', lastOk: null, bestMethod: null };
-    }
-
-    var total = positive + negative;
-    var score = total > 0 ? positive / total : 0;
-    if (!(score >= 0)) score = 0;
-    if (!(score <= 1)) score = 1;
-
-    var state;
-    if (foundCount > 0 && failureCount > 0) state = 'degraded';
-    else if (foundCount > 0) state = 'ok';
-    else state = 'down';
-
-    var bestMethod = null;
-    if (foundCount > 0) {
-      var bestName = null;
-      var bestEntry = null;
-      for (var key in methods) {
-        if (!Object.prototype.hasOwnProperty.call(methods, key)) continue;
-        var cand = methods[key];
-        if (bestEntry === null
-          || cand.count > bestEntry.count
-          || (cand.count === bestEntry.count && cand.lastAt > bestEntry.lastAt)
-          || (cand.count === bestEntry.count && cand.lastAt === bestEntry.lastAt && key < bestName)) {
-          bestName = key;
-          bestEntry = cand;
-        }
-      }
-      if (bestName !== null) bestMethod = bestName;
-    }
-
-    return { score: score, state: state, lastOk: lastOk, bestMethod: bestMethod };
-  }
-
-  var api = { profile: profile };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.profile = api;
-  }
-})(typeof window !== 'undefined' && window ? window
-  : (typeof self !== 'undefined' && self ? self : null));
-
-(function (root) {
-  'use strict';
-
-  var LADDER = [0, 0, 60000, 300000, 1800000];
-  var QUARANTINE_MS = 86400000;
-  var ACTION_NONE = 'none';
-  var ACTION_PAUSE = 'pause';
-  var ACTION_QUARANTINE = 'quarantine';
-
-  var RULES = {
-    FOUND: { pauseMs: 0, action: ACTION_NONE },
-    EMPTY: { pauseMs: 0, action: ACTION_NONE }
-  };
-
-  var QUARANTINE_CLASSES = {
-    CORS_BLOCKED: true,
-    INCOMPATIBLE_FORMAT: true
-  };
-
-  function normalizeStreak(profile) {
-    if (profile === null || typeof profile !== 'object') return 0;
-    var streak = profile.streak;
-    if (typeof streak !== 'number' || !isFinite(streak)) return 0;
-    var floored = Math.floor(streak);
-    return floored > 0 ? floored : 0;
-  }
-
-  function ladderDecision(streak) {
-    var pauseMs = LADDER[Math.min(streak, LADDER.length - 1)];
-    return { pauseMs: pauseMs, action: pauseMs > 0 ? ACTION_PAUSE : ACTION_NONE };
-  }
-
-  function decide(profile, outcomeClass, hasAlternative) {
-    var kind = typeof outcomeClass === 'string' ? outcomeClass : '';
-
-    if (Object.prototype.hasOwnProperty.call(RULES, kind)) {
-      var rule = RULES[kind];
-      return { pauseMs: rule.pauseMs, action: rule.action };
-    }
-
-    if (!hasAlternative && Object.prototype.hasOwnProperty.call(QUARANTINE_CLASSES, kind)) {
-      return { pauseMs: QUARANTINE_MS, action: ACTION_QUARANTINE };
-    }
-
-    return ladderDecision(normalizeStreak(profile));
-  }
-
-  var api = { decide: decide, LADDER: LADDER, QUARANTINE_MS: QUARANTINE_MS };
-
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.policy = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * registry alternative (b): a priority list of implementations per source.
- * Conforms to kb/registry/CONTRACT.md.
- *
- * createRegistry() -> { register(impl), choose(sourceId, profileFn) -> impl | null }
- *
- * The registration order of each source is its priority list: the first
- * registered implementation is the primary one, the next ones are fallbacks.
- * choose() reduces the preference reported by profileFn(impl, sourceId) to a
- * single implementation: the maximum wins, ties go to the earlier registration.
- *
- * Switching on failures and the daily retry of a rejected implementation are
- * expressed by the caller through profileFn; the registry keeps no history:
- * - a healthy implementation reports a positive constant (equal constants keep
- *   the priority order through the stable tie-break);
- * - a failed implementation that must not be retried yet reports -Infinity,
- *   so the choice switches to the next implementation in the list;
- * - when the daily retry is due (about 24 h after the failure, the quarantine
- *   convention: 86400000 ms), profileFn reports the healthy constant again and
- *   the rejected implementation is probed once more;
- * - while every implementation is rejected, the top of the priority list is
- *   returned, so the daily probe always has a candidate.
- *
- * Pure, deterministic, no external dependencies. Works both in Node
- * (module.exports) and in the browser (window.LampaVideoFinderKB.registry).
- */
-(function (root) {
-  'use strict';
-
-  /* -------------------------------------------------------------- preference */
-
-  // A number counts as is; an object counts as its numeric `score` field;
-  // everything else (NaN, Infinity, undefined, a missing score) ranks last.
-  function normalizePreference(raw) {
-    var value = raw;
-    if (value !== null && typeof value === 'object') value = value.score;
-    if (typeof value === 'number' && isFinite(value)) return value;
-    return -Infinity;
-  }
-
-  function findIndexById(order, id) {
-    for (var i = 0; i < order.length; i++) {
-      if (order[i].id === id) return i;
-    }
-    return -1;
-  }
-
-  /* ---------------------------------------------------------------- factory */
-
-  function createRegistry() {
-    var order = []; // registration order = priority order
-
-    function register(impl) {
-      if (typeof impl !== 'object' || impl === null) {
-        throw new TypeError('registry: impl must be an object');
-      }
-      if (typeof impl.id !== 'string' || impl.id === '') {
-        throw new TypeError('registry: impl.id must be a non-empty string');
-      }
-      if (typeof impl.sourceId !== 'string' || impl.sourceId === '') {
-        throw new TypeError('registry: impl.sourceId must be a non-empty string');
-      }
-      var index = findIndexById(order, impl.id);
-      if (index === -1) order.push(impl);
-      else order[index] = impl; // duplicate id: replace in place, order kept
-    }
-
-    function choose(sourceId, profileFn) {
-      var best = null;
-      var bestScore = -Infinity;
-      for (var i = 0; i < order.length; i++) {
-        var impl = order[i];
-        if (impl.sourceId !== sourceId) continue;
-        if (typeof profileFn !== 'function') return impl; // the top priority
-        var score = normalizePreference(profileFn(impl, sourceId));
-        if (best === null || score > bestScore) {
-          bestScore = score;
-          best = impl;
-        }
-      }
-      return best;
-    }
-
-    return { register: register, choose: choose };
-  }
-
-  /* --------------------------------------------------------------- exports */
-
-  if (typeof module === 'object' && module.exports) module.exports = createRegistry;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.registry = createRegistry;
-  }
-})(typeof window !== 'undefined' ? window
-  : typeof self !== 'undefined' ? self
-  : typeof globalThis !== 'undefined' ? globalThis
-  : undefined);
-
-(function (root) {
-  'use strict';
-
-  var DEFAULT_KEY = 'video_finder_routes.v1';
-  var ROUTE_KEYS = ['sourceId', 'page', 'method', 'checkedAt', 'persistence'];
-  var PERSISTENCE = ['persistent', 'ephemeral'];
-
-  function isNonEmptyString(value) {
-    return typeof value === 'string' && value.length > 0;
-  }
-
-  function requireMovieId(movieId) {
-    if (!isNonEmptyString(movieId)) {
-      throw new TypeError('movieId must be a non-empty string');
-    }
-  }
-
-  function normalizeRoute(route, now) {
-    if (!route || typeof route !== 'object' || Array.isArray(route)) {
-      throw new TypeError('route must be an object');
-    }
-
-    var keys = Object.keys(route);
-    for (var i = 0; i < keys.length; i++) {
-      if (ROUTE_KEYS.indexOf(keys[i]) === -1) {
-        throw new TypeError('unknown route key: ' + keys[i]);
-      }
-    }
-
-    if (!isNonEmptyString(route.sourceId)) {
-      throw new TypeError('sourceId must be a non-empty string');
-    }
-    if (!isNonEmptyString(route.page)) {
-      throw new TypeError('page must be a non-empty string');
-    }
-    if (!isNonEmptyString(route.method)) {
-      throw new TypeError('method must be a non-empty string');
-    }
-    if (PERSISTENCE.indexOf(route.persistence) === -1) {
-      throw new TypeError('persistence must be one of ' + PERSISTENCE.join('/'));
-    }
-
-    var checkedAt = route.checkedAt;
-    if (checkedAt === undefined || checkedAt === null) {
-      checkedAt = now();
-    }
-    if (typeof checkedAt !== 'number' || !isFinite(checkedAt)) {
-      throw new TypeError('checkedAt must be a finite number');
-    }
-
-    return {
-      sourceId: route.sourceId,
-      page: route.page,
-      method: route.method,
-      checkedAt: checkedAt,
-      persistence: route.persistence
-    };
-  }
-
-  function copyRoute(route) {
-    return {
-      sourceId: route.sourceId,
-      page: route.page,
-      method: route.method,
-      checkedAt: route.checkedAt,
-      persistence: route.persistence
-    };
-  }
-
-  function freshData() {
-    return { version: 1, index: {}, movies: {} };
-  }
-
-  function createRoutes(storage, opts) {
-    var options = opts || {};
-    var key = isNonEmptyString(options.key) ? options.key : DEFAULT_KEY;
-    var now = typeof options.now === 'function'
-      ? options.now
-      : (typeof options.now === 'number' ? function () { return options.now; } : Date.now);
-
-    function load() {
-      var raw = storage.get(key, null);
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return freshData();
-      var data = freshData();
-      if (raw.index && typeof raw.index === 'object' && !Array.isArray(raw.index)) {
-        data.index = raw.index;
-      }
-      if (raw.movies && typeof raw.movies === 'object' && !Array.isArray(raw.movies)) {
-        data.movies = raw.movies;
-      }
-      return data;
-    }
-
-    function save(data) {
-      storage.set(key, data);
-    }
-
-    function indexAdd(data, sourceId, movieId) {
-      var list = data.index[sourceId];
-      if (!Array.isArray(list)) list = [];
-      if (list.indexOf(movieId) === -1) list.push(movieId);
-      data.index[sourceId] = list;
-    }
-
-    function indexRemoveMovie(data, movieId) {
-      var sources = Object.keys(data.index);
-      for (var i = 0; i < sources.length; i++) {
-        var sourceId = sources[i];
-        var list = data.index[sourceId];
-        if (!Array.isArray(list)) continue;
-        var at = list.indexOf(movieId);
-        if (at === -1) continue;
-        list.splice(at, 1);
-        if (list.length === 0) delete data.index[sourceId];
-        else data.index[sourceId] = list;
-      }
-    }
-
-    function remember(movieId, route) {
-      requireMovieId(movieId);
-      var normalized = normalizeRoute(route, now);
-      var data = load();
-
-      var list = data.movies[movieId];
-      if (!Array.isArray(list)) list = [];
-      var replaced = false;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i] && list[i].sourceId === normalized.sourceId) {
-          list[i] = copyRoute(normalized);
-          replaced = true;
-          break;
-        }
-      }
-      if (!replaced) list.push(copyRoute(normalized));
-      data.movies[movieId] = list;
-
-      indexAdd(data, normalized.sourceId, movieId);
-      save(data);
-      return copyRoute(normalized);
-    }
-
-    function routesFor(movieId) {
-      requireMovieId(movieId);
-      var data = load();
-      var list = data.movies[movieId];
-      if (!Array.isArray(list)) return [];
-      var copy = [];
-      for (var i = 0; i < list.length; i++) {
-        if (list[i]) copy.push(copyRoute(list[i]));
-      }
-      copy.sort(function (a, b) { return b.checkedAt - a.checkedAt; });
-      return copy;
-    }
-
-    function forget(movieId) {
-      requireMovieId(movieId);
-      var data = load();
-      if (!Object.prototype.hasOwnProperty.call(data.movies, movieId)) return false;
-      delete data.movies[movieId];
-      indexRemoveMovie(data, movieId);
-      save(data);
-      return true;
-    }
-
-    return { remember: remember, routesFor: routesFor, forget: forget };
-  }
-
-  var api = { createRoutes: createRoutes };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.routes = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function () {
-  'use strict';
-
-  const SCHEMA_KEY = 'video_finder_kb_schema';
-  const KB_PREFIX = 'video_finder_kb_';
-  const CACHE_KEY = 'video_finder_cache_v2';
-  const ADDONS_KEY = 'video_finder_stremio_addons_v1';
-
-  function isStorage(obj) {
-    return obj && typeof obj.get === 'function' && typeof obj.set === 'function';
-  }
-
-  function migrate(storage) {
-    if (!isStorage(storage)) {
-      throw new TypeError('storage must have get/set methods');
-    }
-    const existing = storage.get(SCHEMA_KEY, undefined);
-    if (existing !== undefined && typeof existing === 'number') {
-      return { schemaVersion: existing, created: false };
-    }
-    const version = 1;
-    storage.set(SCHEMA_KEY, version);
-    return { schemaVersion: version, created: true };
-  }
-
-  // The observation contract permits both JSON strings and plain objects.
-  function parseDoc(raw) {
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
-  }
-  function enforce(store, maxBytes) {
-    if (typeof maxBytes !== 'number' || !isFinite(maxBytes) || maxBytes < 0) {
-      throw new TypeError('maxBytes must be a finite non-negative number');
-    }
-    if (!store || typeof store.size !== 'function' ||
-        typeof store.exportAll !== 'function' || typeof store.importAll !== 'function') {
-      throw new TypeError('store must support size/exportAll/importAll');
-    }
-    if (store.size() <= maxBytes) {
-      return { bytes: store.size(), maxBytes: maxBytes, removed: 0 };
-    }
-    const doc = parseDoc(store.exportAll());
-    if (!doc || !Array.isArray(doc.events)) {
-      throw new TypeError('observation export must contain events[]');
-    }
-    // Serialized size decreases as the oldest events are removed. Binary
-    // search avoids one persistent storage write per evicted event on TVs.
-    const events = doc.events.slice();
-    let low = 0;
-    let high = events.length;
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      store.importAll(Object.assign({}, doc, { events: events.slice(mid) }));
-      if (store.size() <= maxBytes) high = mid;
-      else low = mid + 1;
-    }
-    // Reapply the minimum fitting suffix, even when all events must go.
-    store.importAll(Object.assign({}, doc, { events: events.slice(low) }));
-    return { bytes: store.size(), maxBytes: maxBytes, removed: low };
-  }
-
-  function exportAll(storage, store) {
-    const schemaVersion = (isStorage(storage)) ? (storage.get(SCHEMA_KEY, 0)) : 0;
-    return {
-      schemaVersion: typeof schemaVersion === 'number' ? schemaVersion : 0,
-      observations: store && typeof store.exportAll === 'function' ? store.exportAll() : { events: [] }
-    };
-  }
-
-  function importAll(storage, store, doc) {
-    if (typeof doc === 'string') {
-      doc = JSON.parse(doc);
-    }
-    if (!doc || typeof doc !== 'object') {
-      throw new TypeError('doc must be an object or JSON string');
-    }
-    if (isStorage(storage)) {
-      if (doc.schemaVersion !== undefined && typeof doc.schemaVersion === 'number' && doc.schemaVersion >= 0) {
-        storage.set(SCHEMA_KEY, doc.schemaVersion);
-      }
-    }
-    if (store && typeof store.importAll === 'function') {
-      store.importAll(doc.observations || doc);
-    }
-    return doc;
-  }
-
-  // Re-export correct enforce
-  const api = {
-    migrate: migrate,
-    enforce: enforce,
-    exportAll: exportAll,
-    importAll: importAll
-  };
-
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = api;
-  }
-  if (typeof window !== 'undefined') {
-    window.LampaVideoFinderKB = window.LampaVideoFinderKB || {};
-    window.LampaVideoFinderKB.budget = api;
-  }
-})();
-
-(function (root) {
-  'use strict';
-
-  var DESCRIPTOR = {
-    sourceId: 'archive',
-    family: 'public-catalog',
-    formats: ['mp4'],
-    requirements: ['https']
-  };
-
-  function describe() {
-    return {
-      sourceId: DESCRIPTOR.sourceId,
-      family: DESCRIPTOR.family,
-      formats: DESCRIPTOR.formats.slice(),
-      requirements: DESCRIPTOR.requirements.slice()
-    };
-  }
-
-  var api = { describe: describe };
-
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors[api.describe().sourceId] = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function (root) {
-  'use strict';
-  var api = {
-    describe: function () {
-      return {
-        sourceId: 'rutube',
-        family: 'video-service',
-        formats: ['hls', 'mp4'],
-        requirements: ['https', 'rutube-api']
-      };
-    }
-  };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors.rutube = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function (root) {
-  'use strict';
-  function describe() {
-    return Object.freeze({
-      sourceId: 'stremio',
-      family: 'addon-protocol',
-      formats: ['mp4', 'hls', 'http'],
-      requirements: ['https', 'addon-manifest', 'movie-series']
-    });
-  }
-  var api = { describe: describe };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors[api.describe().sourceId] = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
 /*
 MIT License
 
@@ -1268,7 +23,8 @@ SOFTWARE.
 
 */
 
-// PluginLampa v0.6.2 · Archive + Rutube + Stremio + Knowledge Base.
+// PluginLampa Tizen v0.5.2 — Archive + Rutube; narrow compatibility build.
+// PluginLampa v0.5.0 · Archive + Rutube + Stremio integration.
 /*
  * Lampa Video Finder — extensible search plugin (prototype)
  * Built-in example adapter: Internet Archive (public catalog search).
@@ -1288,48 +44,10 @@ SOFTWARE.
   window.__lampa_video_finder_v1 = true;
   var providers = [];
   var actions = [];
-  var resultsNavigationGeneration = 0;
-  var activeNativePage = null;
-  var movieLookupRevision = 0;
-  var movieLookupTimer = null;
-  function displayMenu(config) {
-    if (activeNativePage && activeNativePage.isAlive()) {
-      activeNativePage.showMenu(config);
-      return;
-    }
-    L.Select.show(config);
-  }
-  function closeMenu() {
-    if (!activeNativePage) L.Select.close();
-  }
-  function exitResults() {
-    if (activeNativePage && activeNativePage.isAlive() &&
-        L.Activity && typeof L.Activity.backward === 'function') {
-      L.Activity.backward();
-    } else L.Controller.toggle('content');
-  }
-  function attachNativePage(page) { activeNativePage = page; }
-  function detachNativePage(page) {
-    if (activeNativePage === page) {
-      activeNativePage = null;
-      ++movieLookupRevision;
-      if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
-      movieLookupTimer = null;
-      ++resultsNavigationGeneration;
-      ++streamNavigationGeneration;
-    }
-  }
-  function openNativePage(card) {
-    if (activeNativePage) return false;
-    var page = window.LampaVideoFinderNativePage;
-    return !!(page && typeof page.open === 'function' && page.open(card));
-  }
+  var busy = false;
   var CACHE_KEY = 'video_finder_cache_v3';
-  var MAX_STARTUP_CACHE_CHARS = 4 * 1024 * 1024;
   var MAX_MOVIES = 120;
   var MAX_RESULTS = 25;
-  // A single Select.show with hundreds of items may strain older TV WebViews.
-  var RESULTS_PAGE_SIZE = 30;
   var MAX_SITES = 150;
   var MISS_TTL_MS = 30 * 60 * 1000;
   var COOLDOWNS_MS = [0, 0, 60 * 1000, 5 * 60 * 1000, 30 * 60 * 1000];
@@ -1410,7 +128,7 @@ SOFTWARE.
       '&q=' + encodeURIComponent(query);
     return httpJson(url).then(function (payload) {
       var documents = payload && payload.response && payload.response.docs;
-      if (!Array.isArray(documents)) throw new Error('Archive: неверный формат ответа поиска');
+      if (!Array.isArray(documents)) return [];
       return documents.filter(function (document) {
         if (!document || !document.identifier || !document.title) return false;
         if (movie.year && document.year && String(movie.year) !== String(document.year)) return false;
@@ -1458,10 +176,8 @@ SOFTWARE.
   function resolveArchive(item) {
     var url = 'https://archive.org/metadata/' + encodeURIComponent(item.id);
     return httpJson(url).then(function (payload) {
-      var files = payload && payload.files;
-      if (!Array.isArray(files)) throw new Error('Archive: неверный формат файлов метаданных');
-      // Extremely large metadata records should not freeze TV menu rendering.
-      return files.slice(0, 1000).filter(function (file) {
+      var files = (payload && payload.files) || [];
+      return files.filter(function (file) {
         return file && file.name && /\.mp4$/i.test(file.name) &&
           file.private !== 'true' && file.private !== true;
       }).map(function (file) {
@@ -1483,12 +199,6 @@ SOFTWARE.
       if (!L.Storage || typeof L.Storage.get !== 'function') return empty;
       var raw = L.Storage.get(CACHE_KEY, '');
       if (!raw) return empty;
-      // Reading a huge/corrupt cache can stall Tizen before Lampa renders.
-      // Skip decoding oversized strings but preserve the stored value for recovery.
-      if (typeof raw === 'string' && raw.length > MAX_STARTUP_CACHE_CHARS) {
-        console.warn('[VideoFinder] Legacy cache too large for startup; keeping stored data unchanged');
-        return empty;
-      }
       var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!parsed || parsed.version !== 2 || !parsed.movies || !parsed.sites ||
           typeof parsed.movies !== 'object' || typeof parsed.sites !== 'object') return empty;
@@ -1548,36 +258,18 @@ SOFTWARE.
     stats.streak = 0;
     stats.cooldownUntil = 0;
     stats.lastOk = Date.now();
-    stats.lastOutcome = '';
-    stats.policyAction = 'none';
     saveCache();
   }
 
-  function recordProviderFailure(provider, error) {
+  function recordProviderFailure(provider) {
     var stats = providerHealth(provider);
     stats.failures += 1;
     stats.streak += 1;
     stats.lastFail = Date.now();
-    // KB M2: drive backoff from the classified outcome, never label a failure EMPTY.
-    // Preserve the legacy ladder if KB is unavailable on an older installation.
-    var pauseMs = COOLDOWNS_MS[Math.min(stats.streak, COOLDOWNS_MS.length - 1)];
-    var kb = knowledgeBase();
-    if (kb && kb.api.policy && typeof kb.api.policy.decide === 'function') {
-      try {
-        var classification = kb.api.outcomes.classify(error).class;
-        var alternatives = providers.some(function (other) {
-          return other.id !== provider.id && other.sourceId &&
-            other.sourceId === provider.sourceId;
-        });
-        var decision = kb.api.policy.decide({streak:stats.streak},classification,alternatives);
-        if (decision && typeof decision.pauseMs === 'number' && isFinite(decision.pauseMs)) {
-          pauseMs = Math.max(0,decision.pauseMs);
-          stats.lastOutcome = classification;
-          stats.policyAction = decision.action;
-        }
-      } catch (err) { console.warn('[PluginLampa KB] policy:',err); }
+    if (stats.streak >= 2) {
+      var index = Math.min(stats.streak, COOLDOWNS_MS.length - 1);
+      stats.cooldownUntil = Date.now() + COOLDOWNS_MS[index];
     }
-    stats.cooldownUntil = pauseMs ? Date.now() + pauseMs : 0;
     saveCache();
   }
 
@@ -1588,7 +280,6 @@ SOFTWARE.
         id: provider.id, name: provider.name, discovery: !!provider.discovery,
         successes: h.successes, empty: h.empty, failures: h.failures,
         streak: h.streak, cooldownUntil: h.cooldownUntil,
-        lastOutcome: h.lastOutcome || '', policyAction: h.policyAction || 'none',
         available: providerAvailable(provider, false)
       };
     });
@@ -1701,31 +392,12 @@ SOFTWARE.
     return prepared;
   }
 
-  // A source may opt into stream caching, but that does not make a signed
-  // URL permanent. Query strings/fragments can carry authorization or expiry
-  // tokens and must never enter local persistent playback data.
-  function persistableStreamUrl(url) {
-    if (typeof url !== 'string' || url.length > 2048 || /[\s\\?#]/.test(url)) return false;
-    if (typeof URL === 'function') {
-      try {
-        var parsed = new URL(url);
-        return /^https?:$/.test(parsed.protocol) && !!parsed.hostname &&
-          !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
-      } catch (err) { return false; }
-    }
-    // Fallback for Tizen WebViews without URL(): reject userinfo and malformed ports.
-    var match = url.match(/^https?:\/\/([a-z0-9][a-z0-9.-]*|\[[a-f0-9:]+\])(?::([0-9]{1,5}))?\/[^\s?#\\]*$/i);
-    return !!match && (!match[2] || Number(match[2]) <= 65535);
-  }
-
   function cachedStreams(movie, provider, item) {
     if (!provider.persistStreams || item.id == null) return null;
     var record = getMovieEntry(movie, false);
     var entry = record && record.providers[provider.id];
     var stream = entry && entry.streams && entry.streams[String(item.id)];
     if (!stream || !Array.isArray(stream.items) || !stream.items.length) return null;
-    // Previously persisted entries may contain query-bearing expired tokens.
-    if (!stream.items.every(function (entry) { return entry && persistableStreamUrl(entry.url); })) return null;
     // Stable static URLs only; never cache short-lived signed URLs from other adapters.
     if (Date.now() - stream.savedAt > 7 * 24 * 60 * 60 * 1000) return null;
     return stream.items;
@@ -1739,7 +411,7 @@ SOFTWARE.
     try {
       var clean = JSON.parse(JSON.stringify(streams.slice(0, 25)));
       clean = clean.filter(function (stream) {
-        return stream && persistableStreamUrl(stream.url);
+        return stream && typeof stream.url === 'string' && domainOf(stream.url);
       });
       if (!clean.length) return;
       if (!entry.streams) entry.streams = {};
@@ -1759,38 +431,31 @@ SOFTWARE.
     }).sort(function (a, b) { return b.lastSeen - a.lastSeen; });
   }
 
-  function showProviders(returnToResults) {
+  function showProviders() {
     var status = providerStatuses();
-    displayMenu({
+    L.Select.show({
       title: 'Подключённые источники · ' + status.length,
       items: status.map(function (p) {
         var label = p.available ? 'доступен' : 'пауза до ' + new Date(p.cooldownUntil).toLocaleTimeString();
         return { title: p.name, subtitle: label + ' · найдено: ' + p.successes +
           ' · пусто: ' + p.empty + ' · ошибок: ' + p.failures +
-          (p.discovery ? ' · поисковик' : ' · каталог') +
-          (p.lastOutcome ? ' · KB: ' + p.lastOutcome + '/' + p.policyAction : '') };
+          (p.discovery ? ' · поисковик' : ' · каталог') };
       }),
       onSelect: function () { notify('Обновить все источники можно из меню результатов'); },
-      onBack: function () {
-        if (returnToResults) returnToResults();
-        else exitResults();
-      }
+      onBack: function () { L.Controller.toggle('content'); }
     });
   }
 
-  function showSources(returnToResults) {
+  function showSources() {
     var sources = sourceList();
     if (!sources.length) { notify('Пока нет сохранённых сайтов'); return; }
-    displayMenu({
+    L.Select.show({
       title: 'Найденные сайты · ' + sources.length,
       items: sources.map(function (source) {
         return { title: source.host, subtitle: 'Через ' + source.providers.join(', ') + ' · находок: ' + source.matches };
       }),
       onSelect: function () { notify('Это каталог обнаруженных сайтов, не отдельные плагины'); },
-      onBack: function () {
-        if (returnToResults) returnToResults();
-        else exitResults();
-      }
+      onBack: function () { L.Controller.toggle('content'); }
     });
   }
 
@@ -1822,35 +487,24 @@ SOFTWARE.
     actions.push(action);
   }
 
-  function safePlaybackUrl(raw) {
-    if (typeof raw !== 'string' || !raw || raw.length > 8192 ||
-        raw !== raw.trim() || /[\s\\<>]/.test(raw)) return '';
-    // Parse the authority ourselves as well: older Tizen has no URL(), and
-    // different browser versions may normalize malformed backslashes/userinfo.
-    var match = raw.match(/^https?:\/\/([^\/?#]+)(?:[\/?#]|$)/i);
-    if (!match || match[1].indexOf('@') !== -1) return '';
-    var host = match[1].match(/^([a-z0-9][a-z0-9.-]*|\[[a-f0-9:]+\])(?::([0-9]{1,5}))?$/i);
-    if (!host || (host[2] && Number(host[2]) > 65535)) return '';
-    if (typeof URL !== 'function') return raw;
-    try {
-      var url = new URL(raw);
-      if (!/^https?:$/.test(url.protocol) || !url.hostname ||
-          url.username || url.password) return '';
-      return url.href;
-    } catch (err) { return ''; }
-  }
-
   function chooseStream(item, video, movie, provider) {
-    var stream = safePlaybackUrl(video && video.url);
-    if (!stream) {
+    var stream = null;
+    var rawStream = String(video && video.url || '');
+    try {
+      if (typeof URL === 'function') stream = new URL(rawStream);
+    } catch (_) { /* old Tizen may not expose URL */ }
+    if (!stream && /^https?:\/\/[^\s\/?#]+(?:[^\s]*)?$/i.test(rawStream)) {
+      stream = { href: rawStream, protocol: rawStream.slice(0, 6).toLowerCase() === 'https:' ? 'https:' : 'http:' };
+    }
+    if (!stream || !/^https?:$/.test(stream.protocol)) {
       notify('Источник вернул неправильный URL', true);
       return;
     }
     try {
-      closeMenu();
+      L.Select.close();
       L.Player.play({
-        url: stream,
-        title: movie.title + ' — ' + (video.title || item.title || provider.name),
+        url: stream.href,
+        title: movie.title + ' — ' + (item.title || provider.name),
         movie: movie.card
       });
     } catch (err) {
@@ -1859,235 +513,41 @@ SOFTWARE.
     }
   }
 
-  function showStreamOptions(streams, item, provider, movie, returnToResults, saved, generation) {
-    function current() { return generation === streamNavigationGeneration; }
-    function back() {
-      if (!current()) return;
-      if (returnToResults) returnToResults();
-      else exitResults();
-    }
-    var grouped = [];
-    streams.forEach(function (video) {
-      if (!video || !video.episodeNumber) return;
-      var key = String(video.episodeNumber);
-      var existing = grouped.filter(function (e) { return e.key === key; })[0];
-      if (!existing) {
-        existing = {key: key, title: video.episodeTitle || ('Серия ' + key), streams: []};
-        grouped.push(existing);
-      }
-      existing.streams.push(video);
-    });
-
-    // Multiple episodes are a navigation level, not a giant flat list
-    // of up to 150 HLS variants. Other providers retain their old flow.
-    if (grouped.length > 1 && grouped.reduce(function (sum, g) {
-      return sum + g.streams.length;
-    }, 0) === streams.length) {
-      function episodeMenu() {
-        if (!current()) return;
-        displayMenu({
-          title: 'Серии · ' + item.title,
-          items: grouped.map(function (group) {
-            return {title: group.title, subtitle: group.streams.length + ' вариантов качества',
-              _episode: group};
-          }),
-          onSelect: function (picked) {
-            if (!current() || !picked) return;
-            var group = picked._episode;
-            if (!group) return;
-            displayMenu({
-              title: group.title + ' · качество',
-              items: group.streams,
-              onSelect: function (stream) {
-                if (current()) chooseStream(item, stream, movie, provider);
-              },
-              onBack: episodeMenu
-            });
-          },
-          onBack: back
-        });
-      }
-      episodeMenu();
-      return;
-    }
-    displayMenu({
-      title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
-      items: streams,
-      onSelect: function (stream) {
-        if (current()) chooseStream(item, stream, movie, provider);
-      },
-      onBack: back
-    });
-  }
-
-  var streamNavigationGeneration = 0;
-  function openStreams(item, provider, movie, returnToResults) {
-    var generation = ++streamNavigationGeneration;
+  function openStreams(item, provider, movie) {
     notify('Получаю список видео...');
-    function cancel() {
-      if (generation !== streamNavigationGeneration) return;
-      ++streamNavigationGeneration;
-      if (returnToResults) returnToResults();
-    }
-    displayMenu({
-      title: 'Получаю видео · ' + (item.title || provider.name),
-      items: [{title: 'Назад', subtitle: 'Отменить ожидание потока'}],
-      onSelect: cancel,
-      onBack: cancel
-    });
     var saved = cachedStreams(movie, provider, item);
     withTimeout(function () {
       return saved || provider.resolve(item, movie);
     }, providerTimeout(provider), 'resolve ' + provider.id).then(function (streams) {
-      if (generation !== streamNavigationGeneration) return;
       if (!Array.isArray(streams) || !streams.length) {
-        notify('Для выбранной записи нет доступных MP4/HLS-потоков', true);
-        if (returnToResults) returnToResults();
+        notify('Для выбранной записи нет доступных MP4-потоков', true);
         return;
       }
       if (!saved) {
         recordProviderSuccess(provider, streams.length);
         rememberStreams(movie, provider, item, streams);
       }
-      showStreamOptions(streams, item, provider, movie, returnToResults, saved, generation);
+      L.Select.show({
+        title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
+        items: streams,
+        onSelect: function (stream) { chooseStream(item, stream, movie, provider); },
+        onBack: function () { L.Controller.toggle('content'); }
+      });
     }).catch(function (err) {
-      if (generation !== streamNavigationGeneration) return;
-      recordProviderFailure(provider, err);
+      recordProviderFailure(provider);
       console.error('[VideoFinder] Resolve failed:', provider.id, err);
       notify('Не удалось получить поток. Возможны CORS/сетевая ошибка.', true);
-      if (returnToResults) returnToResults();
     });
   }
 
-  // Lazy optional knowledge base; legacy cache remains the source of playback data.
-  var knowledge = null;
-  function knowledgeBase() {
-    if (knowledge) return knowledge;
-    var k = window.LampaVideoFinderKB;
-    if (!k || !k.observations || !k.outcomes || !k.routes || !k.profile || !k.registry || !k.budget) return null;
-    try {
-      k.budget.migrate(L.Storage);
-      knowledge = {
-        api:k, observations:k.observations.createStore(L.Storage,{maxEvents:250}),
-        routes:k.routes.createRoutes(L.Storage), registry:k.registry()
-      };
-      providers.forEach(function(p){knowledge.registry.register({id:p.id,sourceId:p.id});});
-    } catch(e) {console.warn('[PluginLampa KB] init:',e); return null;}
-    return knowledge;
-  }
-  // Lampa.Storage can be small on older Smart TVs. Budget uses UTF-8 bytes,
-  // while observation store.size() deliberately counts events.
-  function kbBytes(kb) {
-    var text = kb.observations.exportAll();
-    try {
-      return encodeURIComponent(text).replace(/%[0-9A-F]{2}/gi, 'X').length;
-    } catch (err) { return text.length * 3; }
-  }
-  function capKB(kb) {
-    var store = {
-      append: function(e) {kb.observations.append(e);},
-      exportAll: function() {return JSON.parse(kb.observations.exportAll());},
-      importAll: function(doc) {kb.observations.importAll(doc);},
-      size: function() {return kbBytes(kb);}
-    };
-    kb.api.budget.enforce(store, 65536);
-  }
-
-  function knowledgeRecord(provider,movie,err,items) {
-    var kb=knowledgeBase();
-    if(!kb)return;
-    try {
-      var count=Array.isArray(items)?items.length:0;
-      var kind=err?kb.api.outcomes.classify(err).class:(count?'FOUND':'EMPTY');
-      kb.observations.append({
-        sourceId:provider.id,class:kind,movieId:movieKey(movie),
-        method:'search',detail:'count='+count
-      });
-      capKB(kb);
-      if(kind==='FOUND'&&items[0]&&typeof items[0].sourceUrl==='string') {
-        var url=items[0].sourceUrl;
-        if((/^https:\/\/archive\.org\/details\/[A-Za-z0-9_.%-]+\/?$/.test(url) ||
-            /^https:\/\/rutube\.ru\/video\/[A-Za-z0-9_-]+\/?$/.test(url)) &&
-           url.indexOf('?')<0&&url.indexOf('#')<0) {
-          kb.routes.remember(movieKey(movie),{
-            sourceId:provider.id,page:url,method:'search',
-            checkedAt:Date.now(),persistence:'persistent'
-          });
-        }
-      }
-    } catch(e) { console.warn('[PluginLampa KB] observation:',e); }
-  }
-  function knowledgeStatus() {
-    var kb=knowledgeBase();
-    if(!kb)return {enabled:false,events:0,sources:[]};
-    var compatible={
-      recent:function(id,limit) {
-        return kb.observations.recent({sourceId:id,limit:limit}).map(function(o) {
-          return {at:o.time,class:o.class,method:o.method};
-        });
-      }
-    };
-    return {enabled:true,events:kb.observations.size(),bytes:kbBytes(kb),
-      sources:providers.map(function(p) {
-        return {id:p.id,profile:kb.api.profile.profile(compatible,p.id,Date.now())};
-      })
-    };
-  }
-
-  // Registry selects one implementation per logical source. Separate source IDs
-  // remain independent; no fallback to title-search or an unrelated catalog.
-  function registrySelection(candidates, forced, movie) {
-    var kb = knowledgeBase();
-    if (!kb || !kb.api || typeof kb.api.registry !== 'function') return candidates;
-    var registry = kb.api.registry();
-    var ids = [];
-    candidates.forEach(function (provider) {
-      var sourceId = provider.sourceId || provider.id;
-      registry.register({id:provider.id,sourceId:sourceId,provider:provider});
-      if (ids.indexOf(sourceId) === -1) ids.push(sourceId);
-    });
-    var chosen = [];
-    ids.forEach(function (sourceId) {
-      var impl = registry.choose(sourceId,function (candidate) {
-        // A fallback must support this card before it can replace the primary.
-        try {
-          if (candidate.provider.supports && !candidate.provider.supports(movie)) return -Infinity;
-        } catch (err) { return -Infinity; }
-        var h = providerHealth(candidate.provider);
-        if (forced) return 1;
-        return h.cooldownUntil > Date.now() ? -Infinity : 1;
-      });
-      if (impl && impl.provider) {
-        var hasSupported = candidates.some(function (p) {
-          if ((p.sourceId || p.id) !== sourceId) return false;
-          try { return !p.supports || p.supports(movie); } catch (err) { return false; }
-        });
-        if (hasSupported) {
-          var supported = !impl.provider.supports;
-          try { if (!supported) supported = !!impl.provider.supports(movie); } catch (err) { supported = false; }
-          if (supported) chosen.push(impl.provider);
-        } else chosen.push(impl.provider); // Preserve unsupported-source diagnostics.
-      }
-    });
-    return chosen;
-  }
-
-  function queryProvider(provider, movie, isCurrent) {
-    return withTimeout(function () {
-      if (!isCurrent()) return [];
-      return provider.search(movie);
-    }, providerTimeout(provider), 'search ' + provider.id).then(function (items) {
-      // A previous card's completed requests must not update persisted cache,
-      // KB observations, provider health or cooldowns for the current session.
-      if (!isCurrent()) return { provider: provider, items: [], stale: true };
+  function queryProvider(provider, movie) {
+    return withTimeout(function () { return provider.search(movie); }, providerTimeout(provider),
+      'search ' + provider.id).then(function (items) {
       if (!Array.isArray(items)) throw new Error('Expected an array of candidates');
       recordProviderSuccess(provider, items.length);
-      knowledgeRecord(provider,movie,null,items);
       return { provider: provider, items: rememberCandidates(movie, provider, items), cached: false };
     }).catch(function (err) {
-      if (!isCurrent()) return { provider: provider, items: [], stale: true };
-      recordProviderFailure(provider, err);
-      knowledgeRecord(provider,movie,err,null);
+      recordProviderFailure(provider);
       console.error('[VideoFinder] Search failed:', provider.id, err);
       // Preserve the last good results; never cache errors as valid empty searches.
       return { provider: provider, items: cachedCandidates(movie, provider) || [],
@@ -2096,32 +556,18 @@ SOFTWARE.
   }
 
   function openResults(movie, refresh, titleSearch) {
-    // Any direct search supersedes an unresolved IMDb lookup.
-    ++movieLookupRevision;
-    if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
-    movieLookupTimer = null;
-    // Entering another results view invalidates a pending stream resolution.
-    ++streamNavigationGeneration;
-    var navigation = ++resultsNavigationGeneration;
     if (!movie.title) {
       notify('В карточке нет названия фильма', true);
-      if (activeNativePage && activeNativePage.isAlive()) displayMenu({
-        title: 'PluginLampa · Ошибка',
-        items: [{title:'Нет названия фильма', subtitle:'Нажми Назад для возврата'}],
-        onSelect: function () {}, onBack: exitResults
-      });
       return;
     }
+    if (busy) return;
+    busy = true;
     var scope = titleSearch || 'all';
-    var selectedProviders = registrySelection(providers.filter(function (p) {
+    var selectedProviders = providers.filter(function (p) {
       return scope === 'all' || (scope === 'titles' ? !!p.titleSearch : !p.titleSearch);
-    }), refresh, movie);
+    });
     var diagnostics = [];
     var cachedGroups = refresh ? [] : selectedProviders.map(function (provider) {
-      // Respect supports() even for saved results: a disabled source must not reappear.
-      try {
-        if (provider.supports && !provider.supports(movie)) return null;
-      } catch (err) { return null; }
       var saved = cachedCandidates(movie, provider);
       return saved ? { provider: provider, items: saved, cached: true } : null;
     }).filter(Boolean);
@@ -2134,7 +580,6 @@ SOFTWARE.
     if (refresh) notify('Обновляю результаты: ' + movie.title);
 
     function searchGroup(group) {
-      if (navigation !== resultsNavigationGeneration) return Promise.resolve([]);
       var active = group.filter(function (provider) {
         try {
           if (provider.supports && !provider.supports(movie)) {
@@ -2164,10 +609,7 @@ SOFTWARE.
       });
       networkCount += active.length;
       return Promise.all(active.map(function (provider) {
-        return queryProvider(provider, movie, function () {
-          return navigation === resultsNavigationGeneration;
-        }).then(function (result) {
-          if (result.stale || navigation !== resultsNavigationGeneration) return result;
+        return queryProvider(provider, movie).then(function (result) {
           diagnostics.push({provider: provider, status: result.error ?
             'Ошибка: ' + result.error : result.items.length ?
             'найдено: ' + result.items.length : (provider.emptyReason ?
@@ -2181,7 +623,6 @@ SOFTWARE.
     // movie, ask specialized source adapters first, discovery engines last.
     var tasks = searchGroup(sourceProviders).then(function (primary) {
       var all = cachedGroups.concat(primary);
-      if (navigation !== resultsNavigationGeneration) return all;
       if (!refresh && all.some(function (group) { return group.items.length; })) return all;
       return searchGroup(discoveryProviders).then(function (found) {
         return all.concat(found);
@@ -2189,8 +630,6 @@ SOFTWARE.
     });
 
     tasks.then(function (groups) {
-      // A newer card, refresh or mode selection owns the menu.
-      if (navigation !== resultsNavigationGeneration) return;
       var results = [];
       groups.forEach(function (group) {
         group.items.forEach(function (item) {
@@ -2210,13 +649,10 @@ SOFTWARE.
       if (!results.length) {
         notify('0 результатов: открой «Диагностика источников» и проверь причины.', true);
       }
-      var menuActions = actions.filter(function (action) {
-        try { return !action.supports || action.supports(movie); }
-        catch (err) { console.warn('[VideoFinder] action supports failed:', action.id, err); return false; }
-      }).map(function (action) {
+      var menuActions = actions.map(function (action) {
         return { title: action.title, subtitle: action.subtitle || '', _actionHandler: action };
       });
-      var utilityEntries = [
+      var entries = results.concat(menuActions, [
         { title: 'Диагностика источников (' + selectedProviders.length + ')', _action: 'diagnostics',
           subtitle: networkCount + ' запросов · причины нулевых результатов' },
         { title: 'Режим: ' + (scope === 'all' ? 'Все источники' : scope === 'titles' ?
@@ -2227,121 +663,53 @@ SOFTWARE.
           subtitle: 'Доступность и статистика', _action: 'providers' },
         { title: 'Найденные сайты (' + sourceList().length + ')',
           subtitle: 'Локально сохранённые сайты', _action: 'sources' }
-      ];
-      var resultPage = 0;
-      var resultsPageRevision = 0;
-      function showResultsMenu() {
-        if (navigation !== resultsNavigationGeneration) return;
-        var lastPage = Math.max(0, Math.ceil(results.length / RESULTS_PAGE_SIZE) - 1);
-        resultPage = Math.max(0, Math.min(resultPage, lastPage));
-        var pageToken = ++resultsPageRevision;
-        var beginning = resultPage * RESULTS_PAGE_SIZE;
-        var pageResults = results.slice(beginning, beginning + RESULTS_PAGE_SIZE);
-        var pages = lastPage + 1;
-        var paging = [];
-        if (resultPage > 0) paging.push({
-          title: '← Предыдущие результаты', _action: 'previous-page',
-          subtitle: 'Страница ' + resultPage + ' из ' + pages
-        });
-        if (resultPage < lastPage) paging.push({
-          title: 'Следующие результаты →', _action: 'next-page',
-          subtitle: 'Страница ' + (resultPage + 2) + ' из ' + pages
-        });
-        // Never give the Tizen UI hundreds of rows at once. All candidates
-        // remain accessible via pages without a new provider network call.
-        var nativeResults = !!(activeNativePage && activeNativePage.isAlive());
-        var entries = nativeResults
-          ? results.concat(menuActions, utilityEntries)
-          : pageResults.concat(paging, menuActions, utilityEntries);
-        displayMenu({
-        _nativeGroupedResults: nativeResults,
-        title: 'Видео · ' + movie.title +
-          (networkCount === 0 ? ' · из памяти' : '') +
-          (pages > 1 ? ' · ' + (resultPage + 1) + '/' + pages : ''),
+      ]);
+      L.Select.show({
+        title: 'Видео · ' + movie.title + (networkCount === 0 ? ' · из памяти' : ''),
         items: entries,
         onSelect: function (selected) {
-          if (navigation !== resultsNavigationGeneration ||
-              pageToken !== resultsPageRevision || !selected) return;
-          if (selected._action === 'next-page') {
-            resultPage++;
-            showResultsMenu();
-            return;
-          }
-          if (selected._action === 'previous-page') {
-            resultPage--;
-            showResultsMenu();
-            return;
-          }
           if (selected._actionHandler) { selected._actionHandler.open(movie); return; }
-          if (selected._action === 'refresh') { closeMenu(); openResults(movie, true, titleSearch); return; }
+          if (selected._action === 'refresh') { L.Select.close(); openResults(movie, true, titleSearch); return; }
           if (selected._action === 'titles') {
-            closeMenu();
+            L.Select.close();
             openResults(movie, false, scope === 'all' ? 'exact' : scope === 'exact' ? 'titles' : 'all');
             return;
           }
           if (selected._action === 'diagnostics') {
-            displayMenu({
+            L.Select.show({
               title: 'Источники · ' + movie.title,
               items: diagnostics.length ? diagnostics.map(function (d) {
                 return {title: d.provider.name, subtitle: d.status};
               }) : [{title: 'Подключённых источников нет'}],
               onSelect: function () {},
-              onBack: showResultsMenu
+              onBack: function () { L.Controller.toggle('content'); }
             });
             return;
           }
-          if (selected._action === 'sources') { showSources(showResultsMenu); return; }
-          if (selected._action === 'providers') { showProviders(showResultsMenu); return; }
-          closeMenu();
-          openStreams(selected._item, selected._provider, movie, showResultsMenu);
+          if (selected._action === 'sources') { showSources(); return; }
+          if (selected._action === 'providers') { showProviders(); return; }
+          L.Select.close();
+          openStreams(selected._item, selected._provider, movie);
         },
-        onBack: function () {
-          if (navigation !== resultsNavigationGeneration ||
-              pageToken !== resultsPageRevision) return;
-          if (resultPage > 0) {
-            resultPage--;
-            showResultsMenu();
-          } else exitResults();
-        }
+        onBack: function () { L.Controller.toggle('content'); }
       });
-      }
-      showResultsMenu();
       if (networkCount === 0 && cacheHit) notify('Показываю сохранённые результаты');
     }).catch(function (err) {
-      if (navigation !== resultsNavigationGeneration) return;
       console.error('[VideoFinder] Unexpected search error', err);
       notify('Ошибка поиска видео', true);
-      if (activeNativePage && activeNativePage.isAlive()) displayMenu({
-        title: 'PluginLampa · Ошибка поиска',
-        items: [{title:'Не удалось получить результаты', subtitle:'Вернись к карточке и попробуй снова'}],
-        onSelect: function () {}, onBack: exitResults
-      });
-    });
+    }).then(function () { busy = false; });
   }
 
   // Additional adapters can be attached from another script after this one.
   window.LampaVideoFinder = {
     requestJson: httpJson,
-    displayMenu: displayMenu,
-    closeMenu: closeMenu,
-    attachNativePage: attachNativePage,
-    detachNativePage: detachNativePage,
-    searchCard: function (card) { openCard(card); },
-    nativePageActive: function () { return !!activeNativePage; },
-    open: function (card) {
-      if (!activeNativePage && openNativePage(card)) return;
-      openResults(movieInfo(card));
-    },
-    // Extensions can reject late responses after another card takes focus.
-    navigationGeneration: function () { return resultsNavigationGeneration; },
+    open: function (card) { openResults(movieInfo(card)); },
     registerProvider: registerProvider,
     unregisterProvider: unregisterProvider,
     registerAction: registerAction,
     listProviders: function () { return providers.map(function (p) { return p.id; }); },
     listKnownSources: sourceList,
     listProviderHealth: providerStatuses,
-    knowledgeStatus: knowledgeStatus,
-    knownRoutes:function(card){var kb=knowledgeBase();return kb?kb.routes.routesFor(movieKey(movieInfo(card))):[];},
     clearMovieCache: function (card) { forgetMovie(movieInfo(card)); },
     clearCache: function () { cache = { version: 2, movies: {}, sites: {}, health: {} }; saveCache(); },
     cacheStats: function () { return { movies: Object.keys(cache.movies).length, sites: sourceList().length }; }
@@ -2363,110 +731,62 @@ SOFTWARE.
     Lampa.Manifest.plugins = {
       type: 'video',
       name: 'Video Finder',
-      version: '0.6.3',
+      version: '0.6.1',
       description: 'Поиск видео с локальным сохранением найденных источников',
       onContextMenu: function () {
         return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
       },
       onContextLauch: openCard
     };
-    // The extra card button is optional. Some Lampa/plugin combinations do
-    // not support this event; the context-menu manifest must still work.
-    try {
-      L.Listener.follow('full', function (event) {
-        if (!event || event.type !== 'complite' || !event.body || !window.$) return;
-        var container = event.body.find('.buttons--container');
-        if (!container.length || container.find('.pluginlampa-watch').length) return;
-        var button = $('<div class="full-start__button selector pluginlampa-watch"><span>PluginLampa</span></div>');
-        button.on('hover:enter', function () {
-          if (event.data && event.data.movie) openCard(event.data.movie);
-        });
-        container.append(button);
-      });
-    } catch (err) {
-      console.warn('[PluginLampa] Optional full-card hook unavailable', err);
-    }
-    console.log('[VideoFinder] Installed v0.6.3. Providers:', window.LampaVideoFinder.listProviders());
+    L.Listener.follow('full', function (event) {
+      if (event.type !== 'complite' || !event.body || !window.$) return;
+      var container = event.body.find('.buttons--container');
+      if (!container.length || container.find('.pluginlampa-watch').length) return;
+      var button = $('<div class="full-start__button selector pluginlampa-watch"><span>PluginLampa</span></div>');
+      button.on('hover:enter', function () { openCard(event.data.movie); });
+      container.append(button);
+    });
+    console.log('[VideoFinder] Installed v0.6.1. Providers:', window.LampaVideoFinder.listProviders());
   }
 
   function openCard(card) {
     card = card || {};
-    if (!activeNativePage && openNativePage(card)) return;
-    ++movieLookupRevision;
-    if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
-    movieLookupTimer = null;
-    var revision = movieLookupRevision;
-    var pageOwner = activeNativePage;
-    function current() {
-      return revision === movieLookupRevision && pageOwner === activeNativePage;
-    }
     var movie = movieInfo(card);
-    // An invalid card has nothing to enrich; show its native error immediately.
-    if (!movie.title) {
-      if (current()) openResults(movie);
-      return;
+    if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id) {
+      openResults(movie); return;
     }
-    if (movie.imdb_id || !L.Api || !L.Api.sources || !L.Api.sources.tmdb || !movie.tmdb_id ||
-        typeof L.Api.sources.tmdb.external_imdb_id !== 'function') {
-      if (current()) openResults(movie);
-      return;
+    if (typeof L.Api.sources.tmdb.external_imdb_id !== 'function') {
+      openResults(movie); return;
     }
     var completed = false;
-    movieLookupTimer = setTimeout(function () {
-      if (completed || !current()) return;
-      completed = true;
-      movieLookupTimer = null;
-      openResults(movie);
+    var timer = setTimeout(function () {
+      if (!completed) { completed = true; openResults(movie); }
     }, 6000);
     try {
-      L.Api.sources.tmdb.external_imdb_id({
-        type: movie.media_type, id: movie.tmdb_id
-      }, function (id) {
-        if (completed || !current()) return;
+      L.Api.sources.tmdb.external_imdb_id({ type: movie.media_type, id: movie.tmdb_id }, function (id) {
+        if (completed) return;
         completed = true;
-        if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
-        movieLookupTimer = null;
+        clearTimeout(timer);
         card.imdb_id = id || '';
         openResults(movieInfo(card));
       });
     } catch (err) {
-      if (!completed && current()) {
-        completed = true;
-        if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
-        movieLookupTimer = null;
-        openResults(movie);
-      }
+      if (!completed) { completed = true; clearTimeout(timer); openResults(movie); }
     }
   }
 
-  var initialized = false;
   function safeInit() {
-    if (initialized) return;
-    initialized = true;
     try { init(); }
     catch (error) {
-      initialized = false;
       console.error('[PluginLampa] Initialization failed', error);
       window.__lampa_video_finder_v1 = false;
     }
   }
   if (window.appready) safeInit();
-  else {
-    try {
-      L.Listener.follow('app', function (event) {
-        if (event && event.type === 'ready') safeInit();
-      });
-      // Ready might have fired between the first check and subscription.
-      if (window.appready) safeInit();
-    } catch (err) {
-      // Do not crash the enclosing Media Station X web application because
-      // another extension replaced or broke the Lampa event dispatcher.
-      console.warn('[PluginLampa] Cannot subscribe to app readiness', err);
-      window.__lampa_video_finder_v1 = false;
-    }
-  }
+  else L.Listener.follow('app', function (event) {
+    if (event.type === 'ready') safeInit();
+  });
 })();
-
 
 /*
  * PluginLampa Rutube provider (independent JS implementation, 2026-10-18).
@@ -2516,10 +836,7 @@ SOFTWARE.
     var url = 'https://rutube.ru/api/search/video/?content_type=video&duration=movie&query=' +
       encodeURIComponent(query);
     return getJson(url).then(function (data) {
-      if (!data || !Array.isArray(data.results)) {
-        throw new Error('Rutube: неверный формат ответа поиска');
-      }
-      var list = data.results.slice(0, 200);
+      var list = Array.isArray(data.results) ? data.results : [];
       return list.filter(function (entry) { return entry && entry.id != null && isMatch(entry, movie); })
         .map(function (entry) {
           var hasYear = !movie.year || clean(entry.title).indexOf(String(movie.year)) !== -1;
@@ -2576,6 +893,8 @@ SOFTWARE.
   });
 })();
 
+
+
 /*
  * Stremio HTTP addon protocol adapter for PluginLampa.
  * Independent implementation based on the public protocol specification:
@@ -2593,45 +912,25 @@ SOFTWARE.
   if (window.LampaVideoFinderStremio) return;
   var CATALOG_URL = 'https://raw.githubusercontent.com/Stremio/stremio-official-addons/master/index.json';
   var STORAGE_KEY = 'video_finder_stremio_addons_v1';
-  // The stored addon list is untrusted and parsed synchronously on TV startup.
-  var MAX_SAVED_CHARS = 512 * 1024;
-  var MAX_MANIFEST_RESOURCES = 128;
-  var MAX_PREFIXES = 128;
   var addons = [];
 
   function notify(text, error) {
     L.Noty.show(text, error ? { style: 'error', time: 5500 } : { time: 3500 });
   }
-  // Older Tizen WebViews may have no global URL constructor.
   function validHttp(raw, httpsOnly) {
     try {
       var value = String(raw || '').trim();
       if (value.indexOf('stremio://') === 0) value = 'https://' + value.slice(10);
-      if (typeof URL === 'function') {
-        var nativeUrl = new URL(value);
-        if ((httpsOnly && nativeUrl.protocol !== 'https:') ||
-            (!httpsOnly && !/^https?:$/.test(nativeUrl.protocol)) ||
-            nativeUrl.username || nativeUrl.password) return '';
-        return nativeUrl.href;
-      }
-      // Only HTTP(S), with an ordinary host, optional port and safe path/query/fragment.
-      // Reject userinfo, whitespace, backslashes and non-HTTP schemes.
-      var found = value.match(/^(https?):\/\/([a-z0-9.-]+|\[[a-f0-9:]+\])(?::([0-9]{1,5}))?(\/[^?#\\\s]*)?(\?[^#\\\s]*)?(#[^\\\s]*)?$/i);
-      if (!found || (httpsOnly && found[1].toLowerCase() !== 'https')) return '';
-      if (found[3] && Number(found[3]) > 65535) return '';
-      return found[1].toLowerCase() + '://' + found[2] +
-        (found[3] ? ':' + found[3] : '') + (found[4] || '/') +
-        (found[5] || '') + (found[6] || '');
+      var url = new URL(value);
+      if ((httpsOnly && url.protocol !== 'https:') ||
+          (!httpsOnly && !/^https?:$/.test(url.protocol)) ||
+          url.username || url.password) return '';
+      return url.href;
     } catch (_) { return ''; }
   }
   function manifestUrl(value) {
     var url = validHttp(value, true);
     if (!url) throw Error('Требуется HTTPS-адрес расширения');
-    if (typeof URL !== 'function') {
-      if (/[?#]/.test(url)) throw Error('Адрес должен оканчиваться на /manifest.json без параметров');
-      return /\/manifest\.json$/i.test(url) ? url :
-        url.replace(/\/+$/, '') + '/manifest.json';
-    }
     var parsed = new URL(url);
     if (parsed.hash || parsed.search) throw Error('Адрес должен оканчиваться на /manifest.json без параметров');
     if (!/\/manifest\.json$/i.test(parsed.pathname)) {
@@ -2642,23 +941,16 @@ SOFTWARE.
   function readSaved() {
     try {
       var raw = L.Storage && L.Storage.get(STORAGE_KEY, '[]');
-      // Avoid parsing an unbounded JSON blob before the first Lampa screen.
-      // Do not rewrite or delete the original value on failure.
-      if (typeof raw === 'string' && raw.length > MAX_SAVED_CHARS) {
-        console.warn('[VideoFinder] Stored Stremio addon list exceeds startup limit');
-        return [];
-      }
       var data = typeof raw === 'string' ? JSON.parse(raw) : raw;
       return Array.isArray(data) ? data.slice(0, 30) : [];
     } catch (_) { return []; }
   }
-  function save(next) {
-    if (!L.Storage || typeof L.Storage.set !== 'function') {
-      throw Error('Stremio: хранилище недоступно');
+  function save() {
+    if (L.Storage && L.Storage.set) {
+      L.Storage.set(STORAGE_KEY, JSON.stringify(addons.map(function (a) {
+        return { url: a.url, manifest: a.manifest };
+      })));
     }
-    L.Storage.set(STORAGE_KEY, JSON.stringify(next.map(function (a) {
-      return { url: a.url, manifest: a.manifest };
-    })));
   }
   function short(value) {
     return String(value || '').replace(/<[^>]+>/g, '').replace(/[\r\n\t]/g, ' ').trim().slice(0, 160);
@@ -2667,21 +959,21 @@ SOFTWARE.
     if (!manifest || !manifest.id || !manifest.name || !Array.isArray(manifest.types) ||
         !Array.isArray(manifest.resources)) throw Error('Неправильный manifest.json');
     if (manifest.behaviorHints && manifest.behaviorHints.configurationRequired) throw Error('Расширение требует настройки на своём сайте');
-    var resources = manifest.resources.slice(0, MAX_MANIFEST_RESOURCES).filter(function (resource) {
+    var resources = manifest.resources.filter(function (resource) {
       return resource === 'stream' || (resource && resource.name === 'stream');
     });
     if (!resources.length) throw Error('Расширение не предоставляет потоки stream');
     return {
       id: short(manifest.id), name: short(manifest.name),
       types: manifest.types.filter(function (v) { return v === 'movie' || v === 'series'; }),
-      idPrefixes: Array.isArray(manifest.idPrefixes) ? manifest.idPrefixes.slice(0, MAX_PREFIXES).filter(function (p) {
+      idPrefixes: Array.isArray(manifest.idPrefixes) ? manifest.idPrefixes.filter(function (p) {
         return typeof p === 'string' && p.length < 40;
       }) : null,
       resources: resources.map(function (r) {
         return typeof r === 'string' ? 'stream' : {
           name: 'stream',
           types: Array.isArray(r.types) ? r.types.filter(function (t) { return t === 'movie' || t === 'series'; }) : null,
-          idPrefixes: Array.isArray(r.idPrefixes) ? r.idPrefixes.slice(0, MAX_PREFIXES).filter(function (p) {
+          idPrefixes: Array.isArray(r.idPrefixes) ? r.idPrefixes.filter(function (p) {
             return typeof p === 'string' && p.length < 40;
           }) : null
         };
@@ -2741,28 +1033,15 @@ SOFTWARE.
     return validHttp(stream.url, false);
   }
   function playableStreams(data, addon) {
-    // Stremio's protocol requires an array. A malformed API response is not
-    // an EMPTY catalog response and must not create a negative cache entry.
-    if (!data || !Array.isArray(data.streams)) {
-      throw Error('Stremio: неверный формат списка потоков');
-    }
-    var received = data.streams;
-    // Keep processing bounded on memory-constrained TV WebViews.
-    var limit = Math.min(received.length, 500);
-    var direct = [];
-    var torrents = 0, external = 0, proxyHeaders = 0;
-    for (var i = 0; i < limit; i++) {
-      var stream = received[i];
-      if (!stream || typeof stream !== 'object') continue;
-      if (stream.infoHash) torrents++;
-      if (stream.externalUrl || stream.ytId) external++;
-      if (stream.behaviorHints && stream.behaviorHints.proxyHeaders) proxyHeaders++;
-      if (playable(stream)) direct.push(stream);
-    }
+    var received = data && Array.isArray(data.streams) ? data.streams : [];
+    var direct = received.filter(playable);
     if (addon) {
       addon.lastResponse = {
-        received: received.length, direct: direct.length,
-        torrents: torrents, external: external, proxyHeaders: proxyHeaders
+        received: received.length,
+        direct: direct.length,
+        torrents: received.filter(function (s) { return s && s.infoHash; }).length,
+        external: received.filter(function (s) { return s && (s.externalUrl || s.ytId); }).length,
+        proxyHeaders: received.filter(function (s) { return s && s.behaviorHints && s.behaviorHints.proxyHeaders; }).length
       };
     }
     return direct;
@@ -2808,53 +1087,28 @@ SOFTWARE.
         }
         return request(endpoint(addon, { type: item.mediaType, id: item.videoId })).then(function (data) {
           var streams = playableStreams(data, addon);
-          var matches = streams.filter(function (stream) {
-            return JSON.stringify([stream.name || '', stream.title || '', stream.description || '']) === item.signature;
-          });
-          if (!matches.length) return [];
-          // Multiple links may have exactly the same name/description. Do not
-          // silently select item.index: addons can reorder streams between
-          // search and resolve, and these links may have different content.
-          // Let the user choose an explicit current URL in the existing menu.
-          return matches.slice(0, 25).map(function (selected, index) {
-            return {
-              title: short(selected.name || item.title || 'Видео') +
-                (matches.length > 1 ? ' · Вариант ' + (index + 1) : ''),
-              subtitle: short(selected.description || selected.title || 'Stremio'),
-              url: playable(selected)
-            };
-          });
+          var matches = streams.filter(function (stream) { return JSON.stringify([stream.name || '', stream.title || '', stream.description || '']) === item.signature; });
+          var selected = matches.length === 1 ? matches[0] : null;
+          if (!selected) return [];
+          return [{ title: short(selected.name || item.title || 'Видео'),
+            subtitle: short(selected.description || selected.title || 'Stremio'), url: selected.url }];
         });
       }
     };
   }
-  function addKnown(url, manifest, persist) {
+  function addKnown(url, manifest) {
     var normalized = manifestUrl(url);
     var info = normalizeManifest(manifest);
     var id = 'stremio:' + hash(normalized);
     var old = addons.find(function (a) { return a.url === normalized; });
-    var addon = { url: normalized, manifest: info, providerId: id };
-    var previous = addons.slice();
-    var next = addons.filter(function (a) { return a.url !== normalized; }).concat([addon]);
-    // Commit settings first. If quota/storage fails, do not alter any live
-    // provider or claim that the addon was successfully installed.
-    if (persist !== false) save(next);
-    try {
-      if (old) engine.unregisterProvider(old.providerId);
-      engine.registerProvider(makeProvider(addon));
-      addons = next;
-    } catch (err) {
-      engine.unregisterProvider(id);
-      if (old) {
-        try { engine.registerProvider(makeProvider(old)); }
-        catch (restoreErr) { console.error('[VideoFinder] Stremio restore failed', restoreErr); }
-      }
-      if (persist !== false) {
-        try { save(previous); }
-        catch (storageErr) { console.warn('[VideoFinder] Stremio storage rollback failed', storageErr); }
-      }
-      throw err;
+    if (old) {
+      engine.unregisterProvider(old.providerId);
+      addons.splice(addons.indexOf(old), 1);
     }
+    var addon = { url: normalized, manifest: info, providerId: id };
+    addons.push(addon);
+    engine.registerProvider(makeProvider(addon));
+    save();
     return { id: id, name: info.name, url: normalized };
   }
   function install(url) {
@@ -2864,15 +1118,9 @@ SOFTWARE.
   function remove(id) {
     var item = addons.find(function (a) { return a.providerId === id; });
     if (!item) return false;
-    var next = addons.filter(function (a) { return a.providerId !== id; });
-    try { save(next); }
-    catch (err) {
-      console.warn('[VideoFinder] Cannot persist Stremio removal', err);
-      notify('Не удалось сохранить изменение Stremio: хранилище недоступно', true);
-      return false;
-    }
     engine.unregisterProvider(item.providerId);
-    addons = next;
+    addons.splice(addons.indexOf(item), 1);
+    save();
     return true;
   }
   function list() {
@@ -2883,17 +1131,14 @@ SOFTWARE.
       notify('В этой версии Lampa нет поля ввода URL', true);
       return;
     }
-    engine.closeMenu();
+    L.Select.close();
     L.Input.edit({ title: 'HTTPS-ссылка Stremio addon /manifest.json', value: '', free: true, nosave: true },
       function (value) {
-        if (!value) { manage(); return; }
+        if (!value) return;
         install(value).then(function (item) {
           notify('Добавлено: ' + item.name);
           manage();
-        }).catch(function (err) {
-          notify('Ошибка расширения: ' + err.message, true);
-          manage();
-        });
+        }).catch(function (err) { notify('Ошибка расширения: ' + err.message, true); });
       });
   }
   function catalog() {
@@ -2908,7 +1153,7 @@ SOFTWARE.
         return { title: short(entry.manifest.name), subtitle: short(entry.manifest.description), url: entry.transportUrl };
       });
       if (!choices.length) { notify('В списке нет источников видео'); return; }
-      engine.displayMenu({title: 'Официальный список Stremio', items: choices,
+      L.Select.show({title: 'Официальный список Stremio', items: choices,
         onSelect: function (choice) {
           install(choice.url).then(function (item) {
             notify('Добавлено: ' + item.name); manage();
@@ -2921,11 +1166,11 @@ SOFTWARE.
     list().forEach(function (addon) {
       items.push({ title: addon.name, subtitle: addon.url + ' · нажмите для удаления', action: 'remove', addon: addon });
     });
-    engine.displayMenu({ title: 'Stremio · расширения (' + addons.length + ')', items: items,
+    L.Select.show({ title: 'Stremio · расширения (' + addons.length + ')', items: items,
       onSelect: function (choice) {
         if (choice.action === 'catalog') return catalog();
         if (choice.action === 'add') return addViaInput();
-        engine.displayMenu({ title: 'Удалить ' + choice.addon.name + '?',
+        L.Select.show({ title: 'Удалить ' + choice.addon.name + '?',
           items: [{ title: 'Нет, оставить', action: 'keep' },
             { title: 'Удалить расширение', action: 'confirm' }],
           onSelect: function (confirm) {
@@ -2938,588 +1183,13 @@ SOFTWARE.
       }, onBack: function () { L.Controller.toggle('content'); }
     });
   }
-  var episodeMenuGeneration = 0;
-  function selectSeriesEpisode(movie) {
-    var menuGeneration = ++episodeMenuGeneration;
-    var cardGeneration = typeof engine.navigationGeneration === 'function' ?
-      engine.navigationGeneration() : null;
-    function current() {
-      return menuGeneration === episodeMenuGeneration &&
-        (cardGeneration === null || cardGeneration === engine.navigationGeneration());
-    }
-    var imdb = String(movie.imdb_id || '');
-    if (!/^tt\d{5,12}$/.test(imdb)) {
-      notify('Нет IMDb ID сериала: выбрать серии через Stremio невозможно', true);
-      return;
-    }
-    notify('Получаю сезоны и серии из Cinemeta...');
-    // The official Stremio metadata addon supplies actual episode numbers.
-    // Do not guess a season/episode or treat an empty list as a stream failure.
-    request('https://v3-cinemeta.strem.io/meta/series/' + imdb + '.json').then(function (body) {
-      if (!current()) return;
-      var raw = body && body.meta && body.meta.videos;
-      if (!Array.isArray(raw)) throw Error('Cinemeta не вернула список серий');
-      var seasons = Object.create(null), count = 0;
-      raw.slice(0, 2500).forEach(function (entry) {
-        if (!entry) return;
-        var season = Number(entry.season), episode = Number(entry.episode);
-        if (!Number.isInteger(season) || !Number.isInteger(episode) ||
-            season < 1 || season > 100 || episode < 1 || episode > 1000) return;
-        var key = String(season);
-        if (!seasons[key]) seasons[key] = [];
-        if (seasons[key].some(function (v) { return v.episode === episode; })) return;
-        seasons[key].push({season: season, episode: episode, title: short(entry.title || entry.name || '')});
-        count++;
-      });
-      if (!count) throw Error('В Cinemeta нет подходящих эпизодов');
-      var groups = Object.keys(seasons).sort(function (a, b) { return Number(a) - Number(b); });
-      function showSeasons() {
-        if (!current()) return;
-        engine.displayMenu({
-          title: 'Stremio · сезоны · ' + movie.title,
-          items: groups.map(function (season) {
-            return {title: 'Сезон ' + season, subtitle: seasons[season].length + ' серий', _season: season};
-          }),
-          onSelect: function (selected) {
-            if (!current() || !selected) return;
-            var episodes = seasons[selected._season];
-            if (!episodes) return;
-            episodes.sort(function (a,b){ return a.episode - b.episode; });
-            engine.displayMenu({
-              title: 'Сезон ' + selected._season + ' · серии',
-              items: episodes.map(function (ep) {
-                return {title: 'Серия ' + ep.episode + (ep.title ? ' · ' + ep.title : ''), _episode: ep};
-              }),
-              onSelect: function (selectedEp) {
-                if (!current() || !selectedEp) return;
-                var ep = selectedEp._episode;
-                if (!ep) return;
-                var card = {}, source = movie.card || {};
-                Object.keys(source).forEach(function (key) {card[key] = source[key];});
-                card.media_type = 'tv';
-                card.imdb_id = imdb;
-                card.season_number = ep.season;
-                card.episode_number = ep.episode;
-                engine.open(card);
-              },
-              onBack: showSeasons
-            });
-          },
-          onBack: function () {
-            if (current()) engine.open(movie.card || {});
-          }
-        });
-      }
-      showSeasons();
-    }).catch(function (err) {
-      if (!current()) return;
-      console.warn('[VideoFinder] Cinemeta episodes failed:', err);
-      notify('Не удалось получить эпизоды Stremio: ' + (err.message || err), true);
-    });
-  }
-
   readSaved().forEach(function (addon) {
-    try { addKnown(addon.url, addon.manifest, false); }
+    try { addKnown(addon.url, addon.manifest); }
     catch (err) { console.warn('[VideoFinder] Ignore invalid saved Stremio addon'); }
   });
   window.LampaVideoFinderStremio = { install: install, remove: remove, list: list, manage: manage };
   engine.registerAction({ id: 'stremio-manage', title: '⚙ Stremio · расширения',
     subtitle: 'Добавить или удалить источник видео', open: manage });
-  engine.registerAction({id: 'stremio-series',
-    title: '📺 Stremio · выбрать серию',
-    subtitle: 'Сезоны и реальные эпизоды из Cinemeta',
-    supports: function (movie) {
-      return movie.media_type === 'tv' && /^tt\d{5,12}$/.test(String(movie.imdb_id || '')) &&
-        !episode(movie) && addons.some(function (a) {
-          return a.manifest.types.indexOf('series') !== -1;
-        });
-    },
-    open: selectSeriesEpisode
-  });
 })();
 
-/*
- * PluginLampa / AniLiberty experimental HTTP provider.
- * Independently written against the documented AniLiberty API v1.
- * Opt-in, disabled by default: live endpoint/CORS and Samsung Tizen playback not yet verified.
- * No tokens, cookies, DRM bypass, headless browser, or external JS.
- */
-(function () {
-  'use strict';
-  var engine = window.LampaVideoFinder;
-  var L = window.Lampa;
-  if (!engine || !L || !engine.registerProvider || !engine.registerAction) return;
-  if (engine.listProviders().indexOf('aniliberty') !== -1) return;
 
-  var BASE = 'https://anilibria.top/api/v1';
-  var KEY = 'video_finder_aniliberty_enabled_v1';
-  var MAX_RELEASES = 12;
-  var MAX_EPISODES = 60;
-  var MAX_STREAMS = 150;
-
-  function enabled() {
-    var value = L.Storage.get(KEY, false);
-    return value === true || value === 'true' || value === 1;
-  }
-  function notify(msg, error) {
-    L.Noty.show(msg, error ? {style: 'error', time: 6000} : {time: 4500});
-  }
-  function clean(text) {
-    return String(text || '').toLowerCase().replace(/[^a-z0-9\u0400-\u04ff]+/g, ' ').trim().replace(/\s+/g, ' ');
-  }
-  function sameTitle(a, b) {
-    a = clean(a); b = clean(b);
-    if (!a || !b) return false;
-    return a === b || (a.length > 9 && b.indexOf(a + ' ') === 0) ||
-      (b.length > 9 && a.indexOf(b + ' ') === 0);
-  }
-  function matching(movie, release) {
-    if (!release || !release.name || !release.id) return false;
-    var names = [release.name.main, release.name.english].filter(Boolean);
-    var wanted = [movie.title, movie.original_title].filter(Boolean);
-    if (!names.some(function (s) {
-      return wanted.some(function (t) { return sameTitle(s, t); });
-    })) return false;
-    if (movie.year && release.year && Math.abs(Number(movie.year) - Number(release.year)) > 1) return false;
-    return true;
-  }
-  function urlStream(value) {
-    var text = String(value || '');
-    // Restrict to absolute HTTPS URLs without embedded login/password or backslashes.
-    return /^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?\/[^\s\\<>]*$/i.test(text) &&
-      text.indexOf('@') < 0 ? text : '';
-  }
-  function api(path) { return engine.requestJson(BASE + path); }
-  function search(movie) {
-    if (!enabled()) return Promise.resolve([]);
-    var names = [movie.title, movie.original_title].filter(Boolean);
-    if (names.length > 1 && clean(names[0]) === clean(names[1])) names.pop();
-    if (!names.length) return Promise.resolve([]);
-    return Promise.all(names.map(function (name) {
-      return api('/app/search/releases?query=' + encodeURIComponent(name)).then(function (response) {
-        if (!Array.isArray(response)) throw Error('AniLiberty: неверный формат ответа поиска');
-        return {ok: true, rows: response.slice(0, 60)};
-      }).catch(function (error) {
-        console.warn('[AniLiberty] Search request failed', error);
-        return {ok: false, rows: []};
-      });
-    })).then(function (groups) {
-      if (!groups.some(function (g) { return g.ok; })) {
-        throw Error('AniLiberty: API недоступен или запрос заблокирован');
-      }
-      var unique = Object.create(null);
-      groups.forEach(function (group) {
-        group.rows.forEach(function (release) {
-          if (!matching(movie, release) || !/^\d{1,12}$/.test(String(release.id))) return;
-          var id = String(release.id);
-          if (unique[id]) return;
-          unique[id] = {
-            id: id,
-            title: String(release.name.main || release.name.english),
-            subtitle: 'AniLiberty · аниме' + (release.year ? ' · ' + release.year : ''),
-            sourceUrl: 'https://anilibria.top/anime/releases/release/' + id,
-            confidence: 85
-          };
-        });
-      });
-      return Object.keys(unique).slice(0, MAX_RELEASES).map(function (id) { return unique[id]; });
-    });
-  }
-  function resolve(item) {
-    if (!item || !/^\d{1,12}$/.test(String(item.id || ''))) {
-      return Promise.reject(Error('AniLiberty: неверный ID релиза'));
-    }
-    return api('/anime/releases/' + encodeURIComponent(String(item.id))).then(function (release) {
-      var episodes = release && release.episodes;
-      if (!Array.isArray(episodes)) throw Error('AniLiberty: неверный формат списка серий');
-      var streams = [];
-      episodes.slice(0, MAX_EPISODES).forEach(function (episode) {
-        if (!episode) return;
-        var ordinal = String(episode.ordinal || episode.number || '');
-        var caption = 'Серия ' + ordinal + (episode.name ? ' · ' + String(episode.name).slice(0, 75) : '');
-        [['1080p',episode.hls_1080],['720p',episode.hls_720],['480p',episode.hls_480]]
-          .forEach(function (quality) {
-            var url = urlStream(quality[1]);
-            if (url && streams.length < MAX_STREAMS) streams.push({
-              title: caption + ' · ' + quality[0],
-              subtitle: 'AniLiberty · HLS ' + quality[0],
-              episodeNumber: ordinal,
-              episodeTitle: caption,
-              quality: quality[0],
-              url: url
-            });
-          });
-      });
-      return streams;
-    });
-  }
-  engine.registerProvider({
-    id: 'aniliberty',
-    name: 'AniLiberty (эксперимент)',
-    siteUrl: 'https://anilibria.top',
-    titleSearch: true,
-    timeoutMs: 12000,
-    persistStreams: false,
-    supports: function (movie) { return enabled() && !!movie.title; },
-    unavailableReason: function () { return 'Выключен. Включи через пункт ⚙ AniLiberty в меню результатов.'; },
-    search: search,
-    resolve: resolve
-  });
-  engine.registerAction({
-    id: 'aniliberty-toggle',
-    title: '⚙ AniLiberty · аниме (эксперимент)',
-    subtitle: 'Включить/выключить отдельный API-источник, пока не проверенный на Tizen',
-    open: function () {
-      var on = !enabled();
-      L.Storage.set(KEY, on);
-      notify('AniLiberty ' + (on ? 'включён' : 'выключен') +
-        '. Нажми ↻ Обновить поиск, чтобы применить изменение.');
-    }
-  });
-})();
-
-/*
- * Native Film Page — Lampa Activity + Component (single universal TV build).
- * Does not replace Lampa's globals or modify the other plugins' controllers.
- */
-(function () {
-  'use strict';
-  var L = window.Lampa;
-  var engine = window.LampaVideoFinder;
-  if (!L || !engine || !L.Component || typeof L.Component.add !== 'function' ||
-      !L.Activity || typeof L.Activity.push !== 'function' ||
-      typeof L.Scroll !== 'function' || !L.Controller ||
-      typeof window.$ !== 'function') return;
-
-  var COMPONENT = 'pluginlampa_page';
-  var MAX_ROWS = 28;
-  var current = null;
-  var jq = window.$;
-
-  function Page(activityData) {
-    var self = this;
-    var scroll = new L.Scroll({ mask: true, over: true });
-    var content = jq('<div class="pluginlampa-native-page" style="padding:1.5em 2em 4em"></div>');
-    var heading = jq('<div style="font-size:1.6em;margin-bottom:1em"></div>');
-    var rows = jq('<div class="pluginlampa-native-rows"></div>');
-    var style = jq('<style>' +
-      '.pluginlampa-native-page{padding:1.3em 2em 4em}' +
-      '.pluginlampa-native-page .online{margin-bottom:.45em}' +
-      '.pluginlampa-native-page .online__body{padding:.9em 1.1em}' +
-      '.pluginlampa-native-page .pluginlampa-selected .online__body{' +
-      'background:rgba(255,255,255,.22);outline:.17em solid #fff;' +
-      'border-radius:.3em}' +
-      '.pluginlampa-native-page .pluginlampa-section{' +
-      'font-weight:bold;font-size:1.12em;opacity:.85;padding:.85em 0 .35em}' +
-      '</style>');
-    var selected = null;
-    var visibleRows = [];
-    var focusMemory = Object.create(null);
-    var selectedIndex = 0;
-    var menu = null;
-    var chosenSource = null;
-    var page = 0;
-    var generation = 0;
-    var alive = true;
-    var started = false;
-    var movie = activityData.movie || {};
-
-    function isActive() {
-      try {
-        return alive && L.Activity.active &&
-          L.Activity.active() && L.Activity.active().activity === self.activity;
-      } catch (_) { return false; }
-    }
-
-    function setFocus() {
-      if (!isActive() || !L.Controller.collectionSet ||
-          !L.Controller.collectionFocus) return;
-      L.Controller.collectionSet(scroll.render());
-      L.Controller.collectionFocus(selected || false, scroll.render());
-    }
-
-    function moveFallback(delta) {
-      if (!isActive() || !visibleRows.length) return;
-      var index = 0;
-      for (var i = 0; i < visibleRows.length; i++) {
-        if (visibleRows[i].node === selected) { index = i; break; }
-      }
-      index = Math.max(0, Math.min(visibleRows.length - 1, index + delta));
-      visibleRows[index].focus();
-      setFocus();
-    }
-
-    function draw() {
-      if (!alive || !menu) return;
-      generation++;
-      var token = generation;
-      var list = Array.isArray(menu.items) ? menu.items : [];
-      var maxPage = Math.max(0, Math.ceil(list.length / MAX_ROWS) - 1);
-      page = Math.max(0, Math.min(page, maxPage));
-      selectedIndex = Math.max(page * MAX_ROWS,
-        Math.min(selectedIndex, Math.max(0, list.length - 1)));
-      if (Math.floor(selectedIndex / MAX_ROWS) !== page) selectedIndex = page * MAX_ROWS;
-      heading.text(menu.title || 'PluginLampa');
-      rows.empty();
-      visibleRows = [];
-      selected = null;
-      var firstRow = null;
-      var restoredRow = null;
-      var view = list.slice(page * MAX_ROWS, page * MAX_ROWS + MAX_ROWS);
-      var lastSource = null;
-      var actions = [];
-      if (page > 0) actions.push({title:'← Предыдущие', _nativeBackPage:true});
-      if (page < maxPage) actions.push({title:'Следующие →', _nativeNextPage:true});
-      view.concat(actions).forEach(function (item, localIndex) {
-        var sourceName = item && item._provider ? item._provider.name : null;
-        if (sourceName && sourceName !== lastSource) {
-          var section = jq('<div class="pluginlampa-section"></div>');
-          section.text(sourceName);
-          rows.append(section);
-        }
-        lastSource = sourceName;
-        var row = jq('<div class="online selector pluginlampa-native-item"></div>');
-        var body = jq('<div class="online__body"></div>');
-        var title = jq('<div class="online__title"></div>');
-        var subtitle = jq('<div class="online__quality"></div>');
-        title.text(String(item && item.title != null ? item.title : 'Видео'));
-        subtitle.text(String(item && item.subtitle != null ? item.subtitle : ''));
-        body.append(title);
-        body.append(subtitle);
-        row.append(body);
-        row.on('hover:enter', function () {
-          if (!alive || token !== generation || !isActive()) return;
-          // Some remote implementations send OK without a preceding focus event.
-          if (!item._nativeNextPage && !item._nativeBackPage) {
-            selectedIndex = page * MAX_ROWS + localIndex;
-            focusMemory[menu.title || 'PluginLampa'] = selectedIndex;
-          }
-          if (item._nativeNextPage) {
-            page++;
-            selectedIndex = page * MAX_ROWS;
-            draw();
-          } else if (item._nativeBackPage) {
-            page--;
-            selectedIndex = page * MAX_ROWS;
-            draw();
-          } else if (menu && typeof menu.onSelect === 'function') {
-            menu.onSelect(item);
-          }
-        });
-        var focusRow = function () {
-          if (!alive || token !== generation || !isActive()) return;
-          if (selected && selected !== row[0]) jq(selected).removeClass('pluginlampa-selected');
-          selected = row[0];
-          row.addClass('pluginlampa-selected');
-          if (menu && !item._nativeNextPage && !item._nativeBackPage) {
-            selectedIndex = page * MAX_ROWS + localIndex;
-            focusMemory[menu.title || 'PluginLampa'] = selectedIndex;
-          }
-          if (typeof scroll.update === 'function') scroll.update(row, true);
-        };
-        row.on('hover:focus', focusRow);
-        visibleRows.push({node: row[0], focus: focusRow});
-        if (!firstRow) firstRow = row[0];
-        if (localIndex === selectedIndex - page * MAX_ROWS) restoredRow = row[0];
-        rows.append(row);
-      });
-      selected = restoredRow || firstRow;
-      if (selected) jq(selected).addClass('pluginlampa-selected');
-      if (!list.length) {
-        var empty = jq('<div style="opacity:.7;padding:1em"></div>');
-        empty.text('Список пуст');
-        rows.append(empty);
-      }
-      if (isActive()) {
-        self.start();
-      }
-    }
-
-    function sourceMenu(root, id) {
-      var rowsForSource = root.items.filter(function (item) {
-        return item && item._provider && item._provider.id === id;
-      });
-      var first = rowsForSource[0];
-      var label = first && first._provider ? first._provider.name : id;
-      return {
-        title: 'PluginLampa · ' + label,
-        items: rowsForSource,
-        onSelect: function (item) {
-          if (!alive || !isActive()) return;
-          root.onSelect(item);
-        },
-        onBack: function () {
-          chosenSource = null;
-          self.showMenu(root);
-        }
-      };
-    }
-
-    function sourceChooser(root) {
-      var providers = [];
-      var counts = Object.create(null);
-      var labels = Object.create(null);
-      var commands = [];
-      root.items.forEach(function (item) {
-        if (item && item._provider && item._provider.id) {
-          var id = item._provider.id;
-          if (!counts[id]) {
-            counts[id] = 0;
-            providers.push(id);
-            labels[id] = item._provider.name || id;
-          }
-          counts[id]++;
-        } else commands.push(item);
-      });
-      var choices = providers.map(function (id) {
-        return {
-          title: labels[id], subtitle: counts[id] + ' результатов · открыть источник',
-          _nativeSource: id
-        };
-      });
-      // Show explicit empty state instead of an unexplained command-only screen.
-      if (!choices.length) choices.push({
-        title: 'Источники ничего не нашли',
-        subtitle: 'Проверь диагностику или обнови поиск',
-        _nativeEmpty: true
-      });
-      choices = choices.concat(commands);
-      return {
-        title: root.title + ' · Источники',
-        items: choices,
-        onSelect: function (item) {
-          if (!alive || !isActive()) return;
-          if (item._nativeEmpty) return;
-          if (item._nativeSource) {
-            chosenSource = item._nativeSource;
-            renderMenu(sourceMenu(root, chosenSource));
-          } else root.onSelect(item);
-        },
-        onBack: function () { L.Activity.backward(); }
-      };
-    }
-
-    function renderMenu(next) {
-      menu = next || {title:'PluginLampa',items:[]};
-      selectedIndex = focusMemory[menu.title || 'PluginLampa'] || 0;
-      page = Math.floor(selectedIndex / MAX_ROWS);
-      draw();
-    }
-
-    this.isAlive = function () { return alive; };
-    this.showMenu = function (next) {
-      if (!alive) return;
-      if (next && next._nativeGroupedResults) {
-        if (chosenSource && !next.items.some(function (item) {
-          return item && item._provider && item._provider.id === chosenSource;
-        })) chosenSource = null;
-        renderMenu(chosenSource ? sourceMenu(next, chosenSource) : sourceChooser(next));
-      } else renderMenu(next);
-    };
-
-    this.create = function () {
-      content.append(style);
-      content.append(heading);
-      content.append(rows);
-      scroll.append(content);
-      current = self;
-      engine.attachNativePage(self);
-      self.showMenu({title:'PluginLampa · Поиск',items:[
-        {title:'Ищем источники...',subtitle:'Результаты появятся на этой странице'}
-      ]});
-      if (self.activity && typeof self.activity.loader === 'function') {
-        self.activity.loader(true);
-      }
-      // The search may throw synchronously if an external plugin changes the
-      // underlying Lampa APIs. The Activity must remain navigable/closeable.
-      try { engine.searchCard(movie); }
-      catch (err) {
-        console.error('[PluginLampa] Native search startup failed', err);
-        self.showMenu({title:'PluginLampa · Ошибка',items:[
-          {title:'Не удалось открыть поиск',subtitle:'Нажми Назад для возврата'}
-        ]});
-      }
-      return self.render();
-    };
-
-    this.render = function () { return scroll.render(); };
-
-    this.start = function () {
-      if (!isActive()) return;
-      if (started) { setFocus(); return; }
-      L.Controller.add('content', {
-        toggle: function () { setFocus(); },
-        left: function () {
-          if (window.Navigator && typeof window.Navigator.canmove === 'function' &&
-              typeof window.Navigator.move === 'function' && window.Navigator.canmove('left')) window.Navigator.move('left');
-          else L.Controller.toggle('menu');
-        },
-        right: function () {
-          if (window.Navigator && typeof window.Navigator.move === 'function') window.Navigator.move('right');
-        },
-        up: function () {
-          if (window.Navigator && typeof window.Navigator.canmove === 'function' &&
-              typeof window.Navigator.move === 'function' && window.Navigator.canmove('up')) window.Navigator.move('up');
-          else moveFallback(-1);
-        },
-        down: function () {
-          if (window.Navigator && typeof window.Navigator.move === 'function') window.Navigator.move('down');
-          else moveFallback(1);
-        },
-        back: function () { self.back(); }
-      });
-      L.Controller.toggle('content');
-      started = true;
-      if (self.activity && typeof self.activity.loader === 'function') {
-        self.activity.loader(false);
-      }
-    };
-
-    this.back = function () {
-      // A paused Activity must not consume Back destined for the top screen.
-      if (!alive || !isActive()) return;
-      if (menu && typeof menu.onBack === 'function') {
-        menu.onBack();
-      } else L.Activity.backward();
-    };
-
-    this.pause = function () { started = false; };
-    this.stop = function () { started = false; };
-    this.destroy = function () {
-      if (!alive) return;
-      alive = false;
-      generation++;
-      engine.detachNativePage(self);
-      if (current === self) current = null;
-      if (typeof scroll.destroy === 'function') scroll.destroy();
-      content.remove();
-      menu = null;
-      visibleRows = [];
-      selected = null;
-    };
-  }
-
-  try {
-    L.Component.add(COMPONENT, Page);
-    window.LampaVideoFinderNativePage = {
-      open: function (card) {
-        if (current && current.isAlive()) return false;
-        try {
-          L.Activity.push({
-            url: '', title: 'PluginLampa', component: COMPONENT,
-            movie: card || {}, page: 1
-          });
-          return true;
-        } catch (err) {
-          console.warn('[PluginLampa] Native Activity push failed', err);
-          return false;
-        }
-      },
-      active: function () { return !!(current && current.isAlive()); }
-    };
-  } catch (err) {
-    console.warn('[PluginLampa] Native page unavailable', err);
-  }
-})();
-
-})();
