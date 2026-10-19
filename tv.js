@@ -1,1241 +1,3 @@
-// PluginLampa v0.6.3 · Archive + Rutube + Stremio + AniLiberty + KB.
-/*
- * observations alternative (a): a bounded ring buffer of raw events whose
- * aggregates are computed on read. Conforms to kb/observations/CONTRACT.md.
- *
- * createStore(storage, opts) -> { append, recent, aggregate, exportAll, importAll, size }
- *
- * Append-only journal, whitelisted event fields, sanitized URLs (no tokens or
- * Stremio query params), one-JSON export/import, in-memory degradation when the
- * storage adapter is missing or broken. No external dependencies. Works both in
- * Node (module.exports) and in the browser (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  var DEFAULT_KEY = 'video_finder_kb_observations_v1';
-  var DEFAULT_MAX_EVENTS = 500;
-  var DETAIL_MAX = 200;
-
-  var CLASSES = [
-    'FOUND', 'EMPTY', 'INCOMPATIBLE_FORMAT', 'API_ERROR', 'CORS_BLOCKED',
-    'SERVER_DOWN', 'TIMEOUT', 'REGION_BLOCKED', 'AUTH_REQUIRED', 'UNCLASSIFIED'
-  ];
-
-  var CLASS_SET = {};
-  for (var ci = 0; ci < CLASSES.length; ci += 1) CLASS_SET[CLASSES[ci]] = true;
-
-  var TOKEN_SEGMENT = /^[A-Za-z0-9_-]+$/;
-  var URL_IN_TEXT = /https?:\/\/[^\s]*/gi;
-
-  function hasOwn(obj, key) {
-    return Object.prototype.hasOwnProperty.call(obj, key);
-  }
-
-  function isFiniteNumber(value) {
-    return typeof value === 'number' && isFinite(value);
-  }
-
-  function isPositiveInteger(value) {
-    return isFiniteNumber(value) && value > 0 && Math.floor(value) === value;
-  }
-
-  function isKnownClass(value) {
-    return typeof value === 'string' && hasOwn(CLASS_SET, value);
-  }
-
-  /* ----------------------------------------------------------- sanitizing */
-
-  function parseUrl(raw) {
-    if (typeof URL === 'function') {
-      try {
-        var parsed = new URL(raw);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-        return { origin: parsed.origin, pathname: parsed.pathname };
-      } catch (ignore) {
-        return null;
-      }
-    }
-    var match = /^(https?):\/\/([^\/?#]+)([^?#]*)/i.exec(raw);
-    if (!match) return null;
-    var authority = match[2];
-    var at = authority.lastIndexOf('@');
-    if (at >= 0) authority = authority.slice(at + 1);
-    if (authority.length === 0) return null;
-    var pathname = match[3] && match[3].length > 0 ? match[3] : '/';
-    return { origin: match[1].toLowerCase() + '://' + authority, pathname: pathname };
-  }
-
-  function sanitizePath(pathname) {
-    var segments = pathname.split('/');
-    for (var i = 0; i < segments.length; i += 1) {
-      if (segments[i].length >= 20 && TOKEN_SEGMENT.test(segments[i])) segments[i] = '<token>';
-    }
-    return segments.join('/');
-  }
-
-  function sanitizeUrl(raw) {
-    if (typeof raw !== 'string' || raw.length === 0) return null;
-    var parsed = parseUrl(raw);
-    if (!parsed) return null;
-    return parsed.origin + sanitizePath(parsed.pathname);
-  }
-
-  function sanitizeDetail(text) {
-    if (typeof text !== 'string' || text.length === 0) return null;
-    var collapsed = text.replace(/[\r\n\t]+/g, ' ');
-    var masked = collapsed.replace(URL_IN_TEXT, function (match) {
-      var safe = sanitizeUrl(match);
-      return safe === null ? '' : safe;
-    });
-    return masked.length > DETAIL_MAX ? masked.slice(0, DETAIL_MAX) : masked;
-  }
-
-  /* --------------------------------------------------------------- events */
-
-  function buildEvent(input, nowFn) {
-    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-      throw new Error('observation event must be an object');
-    }
-    if (typeof input.sourceId !== 'string' || input.sourceId.length === 0) {
-      throw new Error('observation event requires a non-empty sourceId');
-    }
-    if (!isKnownClass(input.class)) {
-      throw new Error('observation event has an unknown class');
-    }
-    var time;
-    if (hasOwn(input, 'time') && input.time !== undefined) {
-      if (!isFiniteNumber(input.time)) {
-        throw new Error('observation event time must be a finite number');
-      }
-      time = input.time;
-    } else {
-      time = nowFn();
-    }
-    return {
-      time: time,
-      sourceId: input.sourceId,
-      class: input.class,
-      movieId: typeof input.movieId === 'string' ? input.movieId : null,
-      method: typeof input.method === 'string' ? input.method : null,
-      route: sanitizeUrl(input.route),
-      detail: sanitizeDetail(input.detail)
-    };
-  }
-
-  function copyEvent(event) {
-    return {
-      time: event.time,
-      sourceId: event.sourceId,
-      class: event.class,
-      movieId: event.movieId,
-      method: event.method,
-      route: event.route,
-      detail: event.detail
-    };
-  }
-
-  function buildStored(input, nowFn, strict) {
-    if (!strict) {
-      try {
-        return buildEvent(input, nowFn);
-      } catch (ignore) {
-        return null;
-      }
-    }
-    return buildEvent(input, nowFn);
-  }
-
-  /* -------------------------------------------------------------- storage */
-
-  function safeGet(storage, key) {
-    if (!storage || typeof storage.get !== 'function') return undefined;
-    try {
-      return storage.get(key, undefined);
-    } catch (ignore) {
-      return undefined;
-    }
-  }
-
-  function safeSet(storage, key, value) {
-    if (!storage || typeof storage.set !== 'function') return;
-    try {
-      storage.set(key, value);
-    } catch (ignore) {
-      /* degradation: memory only */
-    }
-  }
-
-  function decode(raw) {
-    if (raw === null || raw === undefined) return null;
-    if (typeof raw === 'string') {
-      if (raw.length === 0) return null;
-      try {
-        return JSON.parse(raw);
-      } catch (ignore) {
-        return null;
-      }
-    }
-    return typeof raw === 'object' ? raw : null;
-  }
-
-  function loadEvents(storage, key, maxEvents, nowFn) {
-    var data = decode(safeGet(storage, key));
-    if (!data || !Array.isArray(data.events)) return [];
-    var restored = [];
-    for (var i = 0; i < data.events.length; i += 1) {
-      var event = buildStored(data.events[i], nowFn, false);
-      if (event) restored.push(event);
-    }
-    return restored.length > maxEvents ? restored.slice(restored.length - maxEvents) : restored;
-  }
-
-  /* ------------------------------------------------------------ selection */
-
-  function readFilter(opts) {
-    var filter = { limit: null };
-    if (isFiniteNumber(opts) && opts >= 0) {
-      filter.limit = Math.floor(opts);
-      return filter;
-    }
-    if (opts && typeof opts === 'object') {
-      if (typeof opts.sourceId === 'string') filter.sourceId = opts.sourceId;
-      if (typeof opts.movieId === 'string') filter.movieId = opts.movieId;
-      if (typeof opts.class === 'string') filter.class = opts.class;
-      if (isFiniteNumber(opts.since)) filter.since = opts.since;
-      if (isFiniteNumber(opts.limit) && opts.limit >= 0) filter.limit = Math.floor(opts.limit);
-    }
-    return filter;
-  }
-
-  function matches(event, filter) {
-    if (hasOwn(filter, 'sourceId') && event.sourceId !== filter.sourceId) return false;
-    if (hasOwn(filter, 'movieId') && event.movieId !== filter.movieId) return false;
-    if (hasOwn(filter, 'class') && event.class !== filter.class) return false;
-    if (hasOwn(filter, 'since') && !(event.time >= filter.since)) return false;
-    return true;
-  }
-
-  /* --------------------------------------------------------------- create */
-
-  function createStore(storage, opts) {
-    var options = opts && typeof opts === 'object' ? opts : {};
-    var key = typeof options.key === 'string' && options.key.length > 0 ? options.key : DEFAULT_KEY;
-    var maxEvents = isPositiveInteger(options.maxEvents) ? options.maxEvents : DEFAULT_MAX_EVENTS;
-    var nowFn = typeof options.now === 'function' ? options.now : function () { return Date.now(); };
-
-    var events = loadEvents(storage, key, maxEvents, nowFn);
-
-    function persist() {
-      safeSet(storage, key, JSON.stringify({ version: 1, events: events }));
-    }
-
-    function append(input) {
-      var event = buildEvent(input, nowFn);
-      events.push(event);
-      if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
-      persist();
-    }
-
-    function recent(opts2) {
-      var filter = readFilter(opts2);
-      var selected = [];
-      for (var i = 0; i < events.length; i += 1) {
-        if (matches(events[i], filter)) selected.push(copyEvent(events[i]));
-      }
-      if (filter.limit !== null && selected.length > filter.limit) {
-        selected = selected.slice(selected.length - filter.limit);
-      }
-      return selected;
-    }
-
-    function aggregate(opts2) {
-      var since = opts2 && typeof opts2 === 'object' && isFiniteNumber(opts2.since) ? opts2.since : null;
-      var total = 0;
-      var sources = Object.create(null);
-      for (var i = 0; i < events.length; i += 1) {
-        var event = events[i];
-        if (since !== null && !(event.time >= since)) continue;
-        total += 1;
-        var source = sources[event.sourceId];
-        if (!source) {
-          source = { total: 0, byClass: Object.create(null), lastOk: null, lastFail: null, lastTime: null };
-          sources[event.sourceId] = source;
-        }
-        source.total += 1;
-        source.byClass[event.class] = (source.byClass[event.class] || 0) + 1;
-        if (event.class === 'FOUND') {
-          if (source.lastOk === null || event.time >= source.lastOk) source.lastOk = event.time;
-        } else if (source.lastFail === null || event.time >= source.lastFail) {
-          source.lastFail = event.time;
-        }
-        if (source.lastTime === null || event.time >= source.lastTime) source.lastTime = event.time;
-      }
-      return { total: total, sources: sources };
-    }
-
-    function exportAll() {
-      var out = [];
-      for (var i = 0; i < events.length; i += 1) out.push(copyEvent(events[i]));
-      return JSON.stringify({ version: 1, events: out });
-    }
-
-    function importAll(json) {
-      var data;
-      if (typeof json === 'string') {
-        try {
-          data = JSON.parse(json);
-        } catch (ignore) {
-          throw new Error('importAll: invalid JSON');
-        }
-      } else if (json && typeof json === 'object') {
-        data = json;
-      } else {
-        throw new Error('importAll: expected a JSON string or object');
-      }
-      if (!data || data.version !== 1 || !Array.isArray(data.events)) {
-        throw new Error('importAll: expected { version: 1, events: [] }');
-      }
-      var next = [];
-      for (var i = 0; i < data.events.length; i += 1) {
-        next.push(buildStored(data.events[i], nowFn, true));
-      }
-      if (next.length > maxEvents) next = next.slice(next.length - maxEvents);
-      events = next;
-      persist();
-    }
-
-    function size() {
-      return events.length;
-    }
-
-    return {
-      append: append,
-      recent: recent,
-      aggregate: aggregate,
-      exportAll: exportAll,
-      importAll: importAll,
-      size: size
-    };
-  }
-
-  var api = { createStore: createStore };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.observations = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * outcomes alternative (a): a rules table over HTTP status, error name/code
- * and exception text. Conforms to kb/outcomes/CONTRACT.md.
- *
- * classify(err, ctx) -> { class, retryable, detail }
- *
- * Pure, never throws, no external dependencies. Works both in Node
- * (module.exports) and in the browser (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  /* ------------------------------------------------------------- kind table */
-
-  var KIND_RULES = {
-    found: 'FOUND',
-    empty: 'EMPTY',
-    not_found: 'EMPTY',
-    no_results: 'EMPTY',
-    incompatible_format: 'INCOMPATIBLE_FORMAT',
-    format: 'INCOMPATIBLE_FORMAT',
-    parse_error: 'INCOMPATIBLE_FORMAT',
-    bad_format: 'INCOMPATIBLE_FORMAT',
-    schema_mismatch: 'INCOMPATIBLE_FORMAT',
-    api_error: 'API_ERROR',
-    api: 'API_ERROR',
-    http_error: 'API_ERROR',
-    upstream_error: 'API_ERROR',
-    rate_limited: 'API_ERROR',
-    cors: 'CORS_BLOCKED',
-    cors_blocked: 'CORS_BLOCKED',
-    blocked: 'CORS_BLOCKED',
-    server_down: 'SERVER_DOWN',
-    server_error: 'SERVER_DOWN',
-    unavailable: 'SERVER_DOWN',
-    connection_refused: 'SERVER_DOWN',
-    network: 'SERVER_DOWN',
-    timeout: 'TIMEOUT',
-    timed_out: 'TIMEOUT',
-    region_blocked: 'REGION_BLOCKED',
-    geo_blocked: 'REGION_BLOCKED',
-    region: 'REGION_BLOCKED',
-    not_available: 'REGION_BLOCKED',
-    auth_required: 'AUTH_REQUIRED',
-    unauthorized: 'AUTH_REQUIRED',
-    forbidden: 'AUTH_REQUIRED',
-    auth: 'AUTH_REQUIRED',
-    login_required: 'AUTH_REQUIRED',
-    token_invalid: 'AUTH_REQUIRED',
-    unclassified: 'UNCLASSIFIED',
-    unknown: 'UNCLASSIFIED'
-  };
-
-  /* -------------------------------------------------------------- err codes */
-
-  var TIMEOUT_CODES = { ETIMEDOUT: true, ESOCKETTIMEDOUT: true, ETIMEOUT: true };
-  var NETWORK_CODES = {
-    ECONNREFUSED: true, ECONNRESET: true, EHOSTUNREACH: true,
-    ENETUNREACH: true, ENOTFOUND: true, EAI_AGAIN: true
-  };
-  var TIMEOUT_NAMES = { AbortError: true, TimeoutError: true };
-
-  /* ------------------------------------------------------------- text table */
-
-  var CORS_PATTERNS = ['cors', 'cross-origin'];
-  var REGION_PATTERNS = ['region', 'geo', 'country', 'not available in your'];
-  var AUTH_PATTERNS = ['unauthori', 'forbidden', 'auth', 'api key', 'invalid token', 'login'];
-  var FORMAT_PATTERNS = ['parse', 'format', 'unexpected token', 'invalid json', 'schema'];
-  var TIMEOUT_PATTERNS = ['timed out', 'timeout'];
-  var NETWORK_PATTERNS = [
-    'enotfound', 'econnrefused', 'econnreset', 'network', 'failed to fetch',
-    'fetch failed', 'socket hang up', 'offline', 'unreachable'
-  ];
-  var API_PATTERNS = ['api error', 'bad request'];
-
-  var TEXT_RULES = [
-    { cls: 'CORS_BLOCKED', patterns: CORS_PATTERNS },
-    { cls: 'REGION_BLOCKED', patterns: REGION_PATTERNS },
-    { cls: 'AUTH_REQUIRED', patterns: AUTH_PATTERNS },
-    { cls: 'INCOMPATIBLE_FORMAT', patterns: FORMAT_PATTERNS },
-    { cls: 'TIMEOUT', patterns: TIMEOUT_PATTERNS },
-    { cls: 'SERVER_DOWN', patterns: NETWORK_PATTERNS },
-    { cls: 'API_ERROR', patterns: API_PATTERNS }
-  ];
-
-  /* ---------------------------------------------------------------- helpers */
-
-  function hasOwn(map, key) {
-    return Object.prototype.hasOwnProperty.call(map, key);
-  }
-
-  function read(obj, key) {
-    if (obj === null || obj === undefined) return undefined;
-    try { return obj[key]; } catch (ignore) { return undefined; }
-  }
-
-  function result(cls, detail) {
-    return {
-      class: cls,
-      retryable: cls !== 'FOUND' && cls !== 'EMPTY',
-      detail: typeof detail === 'string' && detail.length > 0 ? detail : cls.toLowerCase()
-    };
-  }
-
-  function textOf(err) {
-    if (typeof err === 'string') return err;
-    if (err !== null && typeof err === 'object') {
-      var message = read(err, 'message');
-      if (typeof message === 'string') return message;
-    }
-    return '';
-  }
-
-  function normalizeToken(value) {
-    if (typeof value !== 'string') return null;
-    var token = value.trim().toLowerCase();
-    return token.length > 0 ? token : null;
-  }
-
-  function normalizeCode(value) {
-    if (typeof value !== 'string') return null;
-    var code = value.trim().toUpperCase();
-    return code.length > 0 ? code : null;
-  }
-
-  function kindClass(value) {
-    var token = normalizeToken(value);
-    if (token && hasOwn(KIND_RULES, token)) return KIND_RULES[token];
-    return null;
-  }
-
-  function matchesAny(text, patterns) {
-    if (typeof text !== 'string' || text.length === 0) return false;
-    var lower = text.toLowerCase();
-    for (var i = 0; i < patterns.length; i += 1) {
-      if (lower.indexOf(patterns[i]) !== -1) return true;
-    }
-    return false;
-  }
-
-  function textClass(text) {
-    for (var i = 0; i < TEXT_RULES.length; i += 1) {
-      if (matchesAny(text, TEXT_RULES[i].patterns)) return TEXT_RULES[i].cls;
-    }
-    return null;
-  }
-
-  function isPositiveInteger(value) {
-    return typeof value === 'number' && isFinite(value) && value > 0 && Math.floor(value) === value;
-  }
-
-  function statusClass(status, text) {
-    if (status === 401) return 'AUTH_REQUIRED';
-    if (status === 403) {
-      if (matchesAny(text, REGION_PATTERNS)) return 'REGION_BLOCKED';
-      if (matchesAny(text, CORS_PATTERNS)) return 'CORS_BLOCKED';
-      return 'AUTH_REQUIRED';
-    }
-    if (status === 408) return 'TIMEOUT';
-    if (status === 429) return 'API_ERROR';
-    if (status === 451) return 'REGION_BLOCKED';
-    if (status >= 400 && status <= 499) return 'API_ERROR';
-    if (status >= 500 && status <= 599) return 'SERVER_DOWN';
-    return null;
-  }
-
-  function pickStatus(err, ctx) {
-    var errCandidates = [
-      read(err, 'status'),
-      read(err, 'statusCode'),
-      read(read(err, 'response'), 'status'),
-      read(err, 'httpStatus')
-    ];
-    for (var i = 0; i < errCandidates.length; i += 1) {
-      if (isPositiveInteger(errCandidates[i])) return errCandidates[i];
-    }
-    var ctxCandidates = [read(ctx, 'httpStatus'), read(ctx, 'status')];
-    for (var j = 0; j < ctxCandidates.length; j += 1) {
-      if (isPositiveInteger(ctxCandidates[j])) return ctxCandidates[j];
-    }
-    return undefined;
-  }
-
-  /* -------------------------------------------------------- classification */
-
-  function classifyFromErr(err, ctx) {
-    var text = textOf(err);
-
-    var byKind = kindClass(read(err, 'kind'));
-    if (byKind) return result(byKind, 'typed marker');
-
-    var status = pickStatus(err, ctx);
-    if (status !== undefined) {
-      var byStatus = statusClass(status, text);
-      if (byStatus) return result(byStatus, 'http status ' + status);
-    }
-
-    var code = normalizeCode(read(err, 'code'));
-    if (code && hasOwn(TIMEOUT_CODES, code)) return result('TIMEOUT', 'error code ' + code);
-    if (code && hasOwn(NETWORK_CODES, code)) return result('SERVER_DOWN', 'error code ' + code);
-
-    var name = read(err, 'name');
-    if (typeof name === 'string' && hasOwn(TIMEOUT_NAMES, name)) return result('TIMEOUT', 'error name ' + name);
-
-    var byText = textClass(text);
-    if (byText) return result(byText, 'message pattern');
-
-    return result('UNCLASSIFIED', 'unrecognised exception');
-  }
-
-  function classifyFromCtx(ctx) {
-    var outcome = read(ctx, 'outcome');
-    var found = read(ctx, 'found');
-    var count = read(ctx, 'resultCount');
-    var items = read(ctx, 'items');
-    var results = read(ctx, 'results');
-
-    if (outcome === 'found' || found === true ||
-        (typeof count === 'number' && isFinite(count) && count > 0) ||
-        (Array.isArray(items) && items.length > 0) ||
-        (Array.isArray(results) && results.length > 0)) {
-      return result('FOUND', 'ctx signals: found');
-    }
-    if (outcome === 'empty' || read(ctx, 'empty') === true ||
-        (typeof count === 'number' && count === 0)) {
-      return result('EMPTY', 'ctx signals: empty');
-    }
-    return result('UNCLASSIFIED', 'ctx signals: unrecognised');
-  }
-
-  function classify(err, ctx) {
-    try {
-      if (err === null || err === undefined) return classifyFromCtx(ctx);
-      return classifyFromErr(err, ctx);
-    } catch (ignore) {
-      return result('UNCLASSIFIED', 'classification failure');
-    }
-  }
-
-  var api = { classify: classify };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.outcomes = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * profile alternative (b): a class-weighted score with exponential decay,
- * computed only from the observation journal. Conforms to kb/profile/CONTRACT.md.
- *
- * profile(store, sourceId, now) -> { score, state, lastOk, bestMethod }
- *
- * The score is the share of positive (FOUND) weight among all weighted
- * meaningful observations, where each observation's weight decays with age
- * (half-life). EMPTY is a successful request without finds: it is treated as
- * neutral and excluded from the score, so it can never worsen a profile.
- * Every failure class weighs strictly more than EMPTY and weights differ by
- * class, so a persistent failure counts more than a transient one.
- *
- * Pure, deterministic for an injected `now`, no external dependencies.
- * Works both in Node (module.exports) and in the browser
- * (window.LampaVideoFinderKB).
- */
-(function (root) {
-  'use strict';
-
-  var DAY_MS = 24 * 60 * 60 * 1000;
-  var HALF_LIFE_MS = 7 * DAY_MS;
-  var RECENT_LIMIT = 500;
-
-  var FOUND = 'FOUND';
-  var EMPTY = 'EMPTY';
-
-  /* Failure severity weights. All are strictly greater than EMPTY (weight 0). */
-  var FAILURE_WEIGHT = {
-    TIMEOUT: 1,
-    API_ERROR: 1,
-    UNCLASSIFIED: 1.5,
-    SERVER_DOWN: 2,
-    AUTH_REQUIRED: 2.5,
-    REGION_BLOCKED: 3,
-    CORS_BLOCKED: 3,
-    INCOMPATIBLE_FORMAT: 3
-  };
-
-  var NEUTRAL = { score: 0, state: 'unknown', lastOk: null, bestMethod: null };
-
-  function isFiniteNumber(value) {
-    return typeof value === 'number' && isFinite(value);
-  }
-
-  function classOf(obs) {
-    if (obs && typeof obs.class === 'string') return obs.class;
-    if (obs && typeof obs.outcome === 'string') return obs.outcome;
-    return '';
-  }
-
-  function atOf(obs) {
-    if (obs && isFiniteNumber(obs.at)) return obs.at;
-    if (obs && isFiniteNumber(obs.ts)) return obs.ts;
-    return null;
-  }
-
-  function methodOf(obs) {
-    return obs && typeof obs.method === 'string' ? obs.method : '';
-  }
-
-  function readJournal(store, sourceId) {
-    if (!store || typeof store.recent !== 'function') return [];
-    var list;
-    try {
-      list = store.recent(sourceId, RECENT_LIMIT);
-    } catch (err) {
-      return [];
-    }
-    return Array.isArray(list) ? list : [];
-  }
-
-  function decayFactor(now, at) {
-    var age = now - at;
-    if (age <= 0) return 1;
-    return Math.pow(0.5, age / HALF_LIFE_MS);
-  }
-
-  function profile(store, sourceId, now) {
-    var clock = isFiniteNumber(now) ? now : 0;
-    var journal = readJournal(store, sourceId);
-
-    var positive = 0;
-    var negative = 0;
-    var foundCount = 0;
-    var failureCount = 0;
-    var lastOk = null;
-    var methods = {};
-
-    for (var i = 0; i < journal.length; i++) {
-      var obs = journal[i];
-      if (!obs || typeof obs !== 'object') continue;
-      var at = atOf(obs);
-      if (at === null || at > clock) continue;
-
-      var weight = decayFactor(clock, at);
-      var cls = classOf(obs);
-
-      if (cls === FOUND) {
-        foundCount++;
-        positive += weight;
-        if (lastOk === null || at > lastOk) lastOk = at;
-        var name = methodOf(obs);
-        if (name) {
-          var entry = methods[name];
-          if (!entry) {
-            entry = { count: 0, lastAt: -Infinity };
-            methods[name] = entry;
-          }
-          entry.count++;
-          if (at > entry.lastAt) entry.lastAt = at;
-        }
-      } else if (cls === EMPTY) {
-        continue;
-      } else {
-        failureCount++;
-        var severity = Object.prototype.hasOwnProperty.call(FAILURE_WEIGHT, cls)
-          ? FAILURE_WEIGHT[cls]
-          : FAILURE_WEIGHT.UNCLASSIFIED;
-        negative += severity * weight;
-      }
-    }
-
-    if (foundCount === 0 && failureCount === 0) {
-      return { score: 0, state: 'unknown', lastOk: null, bestMethod: null };
-    }
-
-    var total = positive + negative;
-    var score = total > 0 ? positive / total : 0;
-    if (!(score >= 0)) score = 0;
-    if (!(score <= 1)) score = 1;
-
-    var state;
-    if (foundCount > 0 && failureCount > 0) state = 'degraded';
-    else if (foundCount > 0) state = 'ok';
-    else state = 'down';
-
-    var bestMethod = null;
-    if (foundCount > 0) {
-      var bestName = null;
-      var bestEntry = null;
-      for (var key in methods) {
-        if (!Object.prototype.hasOwnProperty.call(methods, key)) continue;
-        var cand = methods[key];
-        if (bestEntry === null
-          || cand.count > bestEntry.count
-          || (cand.count === bestEntry.count && cand.lastAt > bestEntry.lastAt)
-          || (cand.count === bestEntry.count && cand.lastAt === bestEntry.lastAt && key < bestName)) {
-          bestName = key;
-          bestEntry = cand;
-        }
-      }
-      if (bestName !== null) bestMethod = bestName;
-    }
-
-    return { score: score, state: state, lastOk: lastOk, bestMethod: bestMethod };
-  }
-
-  var api = { profile: profile };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.profile = api;
-  }
-})(typeof window !== 'undefined' && window ? window
-  : (typeof self !== 'undefined' && self ? self : null));
-
-(function (root) {
-  'use strict';
-
-  var LADDER = [0, 0, 60000, 300000, 1800000];
-  var QUARANTINE_MS = 86400000;
-  var ACTION_NONE = 'none';
-  var ACTION_PAUSE = 'pause';
-  var ACTION_QUARANTINE = 'quarantine';
-
-  var RULES = {
-    FOUND: { pauseMs: 0, action: ACTION_NONE },
-    EMPTY: { pauseMs: 0, action: ACTION_NONE }
-  };
-
-  var QUARANTINE_CLASSES = {
-    CORS_BLOCKED: true,
-    INCOMPATIBLE_FORMAT: true
-  };
-
-  function normalizeStreak(profile) {
-    if (profile === null || typeof profile !== 'object') return 0;
-    var streak = profile.streak;
-    if (typeof streak !== 'number' || !isFinite(streak)) return 0;
-    var floored = Math.floor(streak);
-    return floored > 0 ? floored : 0;
-  }
-
-  function ladderDecision(streak) {
-    var pauseMs = LADDER[Math.min(streak, LADDER.length - 1)];
-    return { pauseMs: pauseMs, action: pauseMs > 0 ? ACTION_PAUSE : ACTION_NONE };
-  }
-
-  function decide(profile, outcomeClass, hasAlternative) {
-    var kind = typeof outcomeClass === 'string' ? outcomeClass : '';
-
-    if (Object.prototype.hasOwnProperty.call(RULES, kind)) {
-      var rule = RULES[kind];
-      return { pauseMs: rule.pauseMs, action: rule.action };
-    }
-
-    if (!hasAlternative && Object.prototype.hasOwnProperty.call(QUARANTINE_CLASSES, kind)) {
-      return { pauseMs: QUARANTINE_MS, action: ACTION_QUARANTINE };
-    }
-
-    return ladderDecision(normalizeStreak(profile));
-  }
-
-  var api = { decide: decide, LADDER: LADDER, QUARANTINE_MS: QUARANTINE_MS };
-
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.policy = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-/*
- * registry alternative (b): a priority list of implementations per source.
- * Conforms to kb/registry/CONTRACT.md.
- *
- * createRegistry() -> { register(impl), choose(sourceId, profileFn) -> impl | null }
- *
- * The registration order of each source is its priority list: the first
- * registered implementation is the primary one, the next ones are fallbacks.
- * choose() reduces the preference reported by profileFn(impl, sourceId) to a
- * single implementation: the maximum wins, ties go to the earlier registration.
- *
- * Switching on failures and the daily retry of a rejected implementation are
- * expressed by the caller through profileFn; the registry keeps no history:
- * - a healthy implementation reports a positive constant (equal constants keep
- *   the priority order through the stable tie-break);
- * - a failed implementation that must not be retried yet reports -Infinity,
- *   so the choice switches to the next implementation in the list;
- * - when the daily retry is due (about 24 h after the failure, the quarantine
- *   convention: 86400000 ms), profileFn reports the healthy constant again and
- *   the rejected implementation is probed once more;
- * - while every implementation is rejected, the top of the priority list is
- *   returned, so the daily probe always has a candidate.
- *
- * Pure, deterministic, no external dependencies. Works both in Node
- * (module.exports) and in the browser (window.LampaVideoFinderKB.registry).
- */
-(function (root) {
-  'use strict';
-
-  /* -------------------------------------------------------------- preference */
-
-  // A number counts as is; an object counts as its numeric `score` field;
-  // everything else (NaN, Infinity, undefined, a missing score) ranks last.
-  function normalizePreference(raw) {
-    var value = raw;
-    if (value !== null && typeof value === 'object') value = value.score;
-    if (typeof value === 'number' && isFinite(value)) return value;
-    return -Infinity;
-  }
-
-  function findIndexById(order, id) {
-    for (var i = 0; i < order.length; i++) {
-      if (order[i].id === id) return i;
-    }
-    return -1;
-  }
-
-  /* ---------------------------------------------------------------- factory */
-
-  function createRegistry() {
-    var order = []; // registration order = priority order
-
-    function register(impl) {
-      if (typeof impl !== 'object' || impl === null) {
-        throw new TypeError('registry: impl must be an object');
-      }
-      if (typeof impl.id !== 'string' || impl.id === '') {
-        throw new TypeError('registry: impl.id must be a non-empty string');
-      }
-      if (typeof impl.sourceId !== 'string' || impl.sourceId === '') {
-        throw new TypeError('registry: impl.sourceId must be a non-empty string');
-      }
-      var index = findIndexById(order, impl.id);
-      if (index === -1) order.push(impl);
-      else order[index] = impl; // duplicate id: replace in place, order kept
-    }
-
-    function choose(sourceId, profileFn) {
-      var best = null;
-      var bestScore = -Infinity;
-      for (var i = 0; i < order.length; i++) {
-        var impl = order[i];
-        if (impl.sourceId !== sourceId) continue;
-        if (typeof profileFn !== 'function') return impl; // the top priority
-        var score = normalizePreference(profileFn(impl, sourceId));
-        if (best === null || score > bestScore) {
-          bestScore = score;
-          best = impl;
-        }
-      }
-      return best;
-    }
-
-    return { register: register, choose: choose };
-  }
-
-  /* --------------------------------------------------------------- exports */
-
-  if (typeof module === 'object' && module.exports) module.exports = createRegistry;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.registry = createRegistry;
-  }
-})(typeof window !== 'undefined' ? window
-  : typeof self !== 'undefined' ? self
-  : typeof globalThis !== 'undefined' ? globalThis
-  : undefined);
-
-(function (root) {
-  'use strict';
-
-  var DEFAULT_KEY = 'video_finder_routes.v1';
-  var ROUTE_KEYS = ['sourceId', 'page', 'method', 'checkedAt', 'persistence'];
-  var PERSISTENCE = ['persistent', 'ephemeral'];
-
-  function isNonEmptyString(value) {
-    return typeof value === 'string' && value.length > 0;
-  }
-
-  function requireMovieId(movieId) {
-    if (!isNonEmptyString(movieId)) {
-      throw new TypeError('movieId must be a non-empty string');
-    }
-  }
-
-  function normalizeRoute(route, now) {
-    if (!route || typeof route !== 'object' || Array.isArray(route)) {
-      throw new TypeError('route must be an object');
-    }
-
-    var keys = Object.keys(route);
-    for (var i = 0; i < keys.length; i++) {
-      if (ROUTE_KEYS.indexOf(keys[i]) === -1) {
-        throw new TypeError('unknown route key: ' + keys[i]);
-      }
-    }
-
-    if (!isNonEmptyString(route.sourceId)) {
-      throw new TypeError('sourceId must be a non-empty string');
-    }
-    if (!isNonEmptyString(route.page)) {
-      throw new TypeError('page must be a non-empty string');
-    }
-    if (!isNonEmptyString(route.method)) {
-      throw new TypeError('method must be a non-empty string');
-    }
-    if (PERSISTENCE.indexOf(route.persistence) === -1) {
-      throw new TypeError('persistence must be one of ' + PERSISTENCE.join('/'));
-    }
-
-    var checkedAt = route.checkedAt;
-    if (checkedAt === undefined || checkedAt === null) {
-      checkedAt = now();
-    }
-    if (typeof checkedAt !== 'number' || !isFinite(checkedAt)) {
-      throw new TypeError('checkedAt must be a finite number');
-    }
-
-    return {
-      sourceId: route.sourceId,
-      page: route.page,
-      method: route.method,
-      checkedAt: checkedAt,
-      persistence: route.persistence
-    };
-  }
-
-  function copyRoute(route) {
-    return {
-      sourceId: route.sourceId,
-      page: route.page,
-      method: route.method,
-      checkedAt: route.checkedAt,
-      persistence: route.persistence
-    };
-  }
-
-  function freshData() {
-    return { version: 1, index: {}, movies: {} };
-  }
-
-  function createRoutes(storage, opts) {
-    var options = opts || {};
-    var key = isNonEmptyString(options.key) ? options.key : DEFAULT_KEY;
-    var now = typeof options.now === 'function'
-      ? options.now
-      : (typeof options.now === 'number' ? function () { return options.now; } : Date.now);
-
-    function load() {
-      var raw = storage.get(key, null);
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return freshData();
-      var data = freshData();
-      if (raw.index && typeof raw.index === 'object' && !Array.isArray(raw.index)) {
-        data.index = raw.index;
-      }
-      if (raw.movies && typeof raw.movies === 'object' && !Array.isArray(raw.movies)) {
-        data.movies = raw.movies;
-      }
-      return data;
-    }
-
-    function save(data) {
-      storage.set(key, data);
-    }
-
-    function indexAdd(data, sourceId, movieId) {
-      var list = data.index[sourceId];
-      if (!Array.isArray(list)) list = [];
-      if (list.indexOf(movieId) === -1) list.push(movieId);
-      data.index[sourceId] = list;
-    }
-
-    function indexRemoveMovie(data, movieId) {
-      var sources = Object.keys(data.index);
-      for (var i = 0; i < sources.length; i++) {
-        var sourceId = sources[i];
-        var list = data.index[sourceId];
-        if (!Array.isArray(list)) continue;
-        var at = list.indexOf(movieId);
-        if (at === -1) continue;
-        list.splice(at, 1);
-        if (list.length === 0) delete data.index[sourceId];
-        else data.index[sourceId] = list;
-      }
-    }
-
-    function remember(movieId, route) {
-      requireMovieId(movieId);
-      var normalized = normalizeRoute(route, now);
-      var data = load();
-
-      var list = data.movies[movieId];
-      if (!Array.isArray(list)) list = [];
-      var replaced = false;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i] && list[i].sourceId === normalized.sourceId) {
-          list[i] = copyRoute(normalized);
-          replaced = true;
-          break;
-        }
-      }
-      if (!replaced) list.push(copyRoute(normalized));
-      data.movies[movieId] = list;
-
-      indexAdd(data, normalized.sourceId, movieId);
-      save(data);
-      return copyRoute(normalized);
-    }
-
-    function routesFor(movieId) {
-      requireMovieId(movieId);
-      var data = load();
-      var list = data.movies[movieId];
-      if (!Array.isArray(list)) return [];
-      var copy = [];
-      for (var i = 0; i < list.length; i++) {
-        if (list[i]) copy.push(copyRoute(list[i]));
-      }
-      copy.sort(function (a, b) { return b.checkedAt - a.checkedAt; });
-      return copy;
-    }
-
-    function forget(movieId) {
-      requireMovieId(movieId);
-      var data = load();
-      if (!Object.prototype.hasOwnProperty.call(data.movies, movieId)) return false;
-      delete data.movies[movieId];
-      indexRemoveMovie(data, movieId);
-      save(data);
-      return true;
-    }
-
-    return { remember: remember, routesFor: routesFor, forget: forget };
-  }
-
-  var api = { createRoutes: createRoutes };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.routes = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function () {
-  'use strict';
-
-  const SCHEMA_KEY = 'video_finder_kb_schema';
-  const KB_PREFIX = 'video_finder_kb_';
-  const CACHE_KEY = 'video_finder_cache_v2';
-  const ADDONS_KEY = 'video_finder_stremio_addons_v1';
-
-  function isStorage(obj) {
-    return obj && typeof obj.get === 'function' && typeof obj.set === 'function';
-  }
-
-  function migrate(storage) {
-    if (!isStorage(storage)) {
-      throw new TypeError('storage must have get/set methods');
-    }
-    const existing = storage.get(SCHEMA_KEY, undefined);
-    if (existing !== undefined && typeof existing === 'number') {
-      return { schemaVersion: existing, created: false };
-    }
-    const version = 1;
-    storage.set(SCHEMA_KEY, version);
-    return { schemaVersion: version, created: true };
-  }
-
-  // The observation contract permits both JSON strings and plain objects.
-  function parseDoc(raw) {
-    return typeof raw === 'string' ? JSON.parse(raw) : raw;
-  }
-  function enforce(store, maxBytes) {
-    if (typeof maxBytes !== 'number' || !isFinite(maxBytes) || maxBytes < 0) {
-      throw new TypeError('maxBytes must be a finite non-negative number');
-    }
-    if (!store || typeof store.size !== 'function' ||
-        typeof store.exportAll !== 'function' || typeof store.importAll !== 'function') {
-      throw new TypeError('store must support size/exportAll/importAll');
-    }
-    if (store.size() <= maxBytes) {
-      return { bytes: store.size(), maxBytes: maxBytes, removed: 0 };
-    }
-    const doc = parseDoc(store.exportAll());
-    if (!doc || !Array.isArray(doc.events)) {
-      throw new TypeError('observation export must contain events[]');
-    }
-    const events = doc.events.slice();
-    let removed = 0;
-    while (events.length && store.size() > maxBytes) {
-      events.shift();
-      removed++;
-      store.importAll(Object.assign({}, doc, { events: events }));
-    }
-    if (!removed && store.size() > maxBytes) store.importAll(Object.assign({}, doc, { events: [] }));
-    return { bytes: store.size(), maxBytes: maxBytes, removed: removed };
-  }
-
-  function exportAll(storage, store) {
-    const schemaVersion = (isStorage(storage)) ? (storage.get(SCHEMA_KEY, 0)) : 0;
-    return {
-      schemaVersion: typeof schemaVersion === 'number' ? schemaVersion : 0,
-      observations: store && typeof store.exportAll === 'function' ? store.exportAll() : { events: [] }
-    };
-  }
-
-  function importAll(storage, store, doc) {
-    if (typeof doc === 'string') {
-      doc = JSON.parse(doc);
-    }
-    if (!doc || typeof doc !== 'object') {
-      throw new TypeError('doc must be an object or JSON string');
-    }
-    if (isStorage(storage)) {
-      if (doc.schemaVersion !== undefined && typeof doc.schemaVersion === 'number' && doc.schemaVersion >= 0) {
-        storage.set(SCHEMA_KEY, doc.schemaVersion);
-      }
-    }
-    if (store && typeof store.importAll === 'function') {
-      store.importAll(doc.observations || doc);
-    }
-    return doc;
-  }
-
-  // Re-export correct enforce
-  const api = {
-    migrate: migrate,
-    enforce: enforce,
-    exportAll: exportAll,
-    importAll: importAll
-  };
-
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = api;
-  }
-  if (typeof window !== 'undefined') {
-    window.LampaVideoFinderKB = window.LampaVideoFinderKB || {};
-    window.LampaVideoFinderKB.budget = api;
-  }
-})();
-
-(function (root) {
-  'use strict';
-
-  var DESCRIPTOR = {
-    sourceId: 'archive',
-    family: 'public-catalog',
-    formats: ['mp4'],
-    requirements: ['https']
-  };
-
-  function describe() {
-    return {
-      sourceId: DESCRIPTOR.sourceId,
-      family: DESCRIPTOR.family,
-      formats: DESCRIPTOR.formats.slice(),
-      requirements: DESCRIPTOR.requirements.slice()
-    };
-  }
-
-  var api = { describe: describe };
-
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors[api.describe().sourceId] = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function (root) {
-  'use strict';
-  var api = {
-    describe: function () {
-      return {
-        sourceId: 'rutube',
-        family: 'video-service',
-        formats: ['hls', 'mp4'],
-        requirements: ['https', 'rutube-api']
-      };
-    }
-  };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors.rutube = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
-(function (root) {
-  'use strict';
-  function describe() {
-    return Object.freeze({
-      sourceId: 'stremio',
-      family: 'addon-protocol',
-      formats: ['mp4', 'hls', 'http'],
-      requirements: ['https', 'addon-manifest', 'movie-series']
-    });
-  }
-  var api = { describe: describe };
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  if (root) {
-    root.LampaVideoFinderKB = root.LampaVideoFinderKB || {};
-    root.LampaVideoFinderKB.descriptors = root.LampaVideoFinderKB.descriptors || {};
-    root.LampaVideoFinderKB.descriptors[api.describe().sourceId] = api;
-  }
-})(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : this));
-
 /*
 MIT License
 
@@ -1261,7 +23,8 @@ SOFTWARE.
 
 */
 
-// PluginLampa v0.6.2 · Archive + Rutube + Stremio + Knowledge Base.
+// PluginLampa Tizen v0.5.2 — Archive + Rutube; narrow compatibility build.
+// PluginLampa v0.5.0 · Archive + Rutube + Stremio integration.
 /*
  * Lampa Video Finder — extensible search plugin (prototype)
  * Built-in example adapter: Internet Archive (public catalog search).
@@ -1495,36 +258,18 @@ SOFTWARE.
     stats.streak = 0;
     stats.cooldownUntil = 0;
     stats.lastOk = Date.now();
-    stats.lastOutcome = '';
-    stats.policyAction = 'none';
     saveCache();
   }
 
-  function recordProviderFailure(provider, error) {
+  function recordProviderFailure(provider) {
     var stats = providerHealth(provider);
     stats.failures += 1;
     stats.streak += 1;
     stats.lastFail = Date.now();
-    // KB M2: drive backoff from the classified outcome, never label a failure EMPTY.
-    // Preserve the legacy ladder if KB is unavailable on an older installation.
-    var pauseMs = COOLDOWNS_MS[Math.min(stats.streak, COOLDOWNS_MS.length - 1)];
-    var kb = knowledgeBase();
-    if (kb && kb.api.policy && typeof kb.api.policy.decide === 'function') {
-      try {
-        var classification = kb.api.outcomes.classify(error).class;
-        var alternatives = providers.some(function (other) {
-          return other.id !== provider.id && other.sourceId &&
-            other.sourceId === provider.sourceId;
-        });
-        var decision = kb.api.policy.decide({streak:stats.streak},classification,alternatives);
-        if (decision && typeof decision.pauseMs === 'number' && isFinite(decision.pauseMs)) {
-          pauseMs = Math.max(0,decision.pauseMs);
-          stats.lastOutcome = classification;
-          stats.policyAction = decision.action;
-        }
-      } catch (err) { console.warn('[PluginLampa KB] policy:',err); }
+    if (stats.streak >= 2) {
+      var index = Math.min(stats.streak, COOLDOWNS_MS.length - 1);
+      stats.cooldownUntil = Date.now() + COOLDOWNS_MS[index];
     }
-    stats.cooldownUntil = pauseMs ? Date.now() + pauseMs : 0;
     saveCache();
   }
 
@@ -1535,7 +280,6 @@ SOFTWARE.
         id: provider.id, name: provider.name, discovery: !!provider.discovery,
         successes: h.successes, empty: h.empty, failures: h.failures,
         streak: h.streak, cooldownUntil: h.cooldownUntil,
-        lastOutcome: h.lastOutcome || '', policyAction: h.policyAction || 'none',
         available: providerAvailable(provider, false)
       };
     });
@@ -1687,7 +431,7 @@ SOFTWARE.
     }).sort(function (a, b) { return b.lastSeen - a.lastSeen; });
   }
 
-  function showProviders(returnToResults) {
+  function showProviders() {
     var status = providerStatuses();
     L.Select.show({
       title: 'Подключённые источники · ' + status.length,
@@ -1695,18 +439,14 @@ SOFTWARE.
         var label = p.available ? 'доступен' : 'пауза до ' + new Date(p.cooldownUntil).toLocaleTimeString();
         return { title: p.name, subtitle: label + ' · найдено: ' + p.successes +
           ' · пусто: ' + p.empty + ' · ошибок: ' + p.failures +
-          (p.discovery ? ' · поисковик' : ' · каталог') +
-          (p.lastOutcome ? ' · KB: ' + p.lastOutcome + '/' + p.policyAction : '') };
+          (p.discovery ? ' · поисковик' : ' · каталог') };
       }),
       onSelect: function () { notify('Обновить все источники можно из меню результатов'); },
-      onBack: function () {
-        if (returnToResults) returnToResults();
-        else L.Controller.toggle('content');
-      }
+      onBack: function () { L.Controller.toggle('content'); }
     });
   }
 
-  function showSources(returnToResults) {
+  function showSources() {
     var sources = sourceList();
     if (!sources.length) { notify('Пока нет сохранённых сайтов'); return; }
     L.Select.show({
@@ -1715,10 +455,7 @@ SOFTWARE.
         return { title: source.host, subtitle: 'Через ' + source.providers.join(', ') + ' · находок: ' + source.matches };
       }),
       onSelect: function () { notify('Это каталог обнаруженных сайтов, не отдельные плагины'); },
-      onBack: function () {
-        if (returnToResults) returnToResults();
-        else L.Controller.toggle('content');
-      }
+      onBack: function () { L.Controller.toggle('content'); }
     });
   }
 
@@ -1767,7 +504,7 @@ SOFTWARE.
       L.Select.close();
       L.Player.play({
         url: stream.href,
-        title: movie.title + ' — ' + (video.title || item.title || provider.name),
+        title: movie.title + ' — ' + (item.title || provider.name),
         movie: movie.card
       });
     } catch (err) {
@@ -1776,204 +513,31 @@ SOFTWARE.
     }
   }
 
-  function showStreamOptions(streams, item, provider, movie, returnToResults, saved) {
-    function back() {
-      if (returnToResults) returnToResults();
-      else L.Controller.toggle('content');
-    }
-    var grouped = [];
-    streams.forEach(function (video) {
-      if (!video || !video.episodeNumber) return;
-      var key = String(video.episodeNumber);
-      var existing = grouped.filter(function (e) { return e.key === key; })[0];
-      if (!existing) {
-        existing = {key: key, title: video.episodeTitle || ('Серия ' + key), streams: []};
-        grouped.push(existing);
-      }
-      existing.streams.push(video);
-    });
-
-    // Multiple episodes are a navigation level, not a giant flat list
-    // of up to 150 HLS variants. Other providers retain their old flow.
-    if (grouped.length > 1 && grouped.reduce(function (sum, g) {
-      return sum + g.streams.length;
-    }, 0) === streams.length) {
-      function episodeMenu() {
-        L.Select.show({
-          title: 'Серии · ' + item.title,
-          items: grouped.map(function (group) {
-            return {title: group.title, subtitle: group.streams.length + ' вариантов качества',
-              _episode: group};
-          }),
-          onSelect: function (picked) {
-            var group = picked._episode;
-            if (!group) return;
-            L.Select.show({
-              title: group.title + ' · качество',
-              items: group.streams,
-              onSelect: function (stream) { chooseStream(item, stream, movie, provider); },
-              onBack: episodeMenu
-            });
-          },
-          onBack: back
-        });
-      }
-      episodeMenu();
-      return;
-    }
-    L.Select.show({
-      title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
-      items: streams,
-      onSelect: function (stream) { chooseStream(item, stream, movie, provider); },
-      onBack: back
-    });
-  }
-
-  var streamNavigationGeneration = 0;
-  function openStreams(item, provider, movie, returnToResults) {
-    var generation = ++streamNavigationGeneration;
+  function openStreams(item, provider, movie) {
     notify('Получаю список видео...');
-    L.Select.show({
-      title: 'Получаю видео · ' + (item.title || provider.name),
-      items: [{title: 'Назад', subtitle: 'Отменить ожидание потока'}],
-      onSelect: function () { ++streamNavigationGeneration; if (returnToResults) returnToResults(); },
-      onBack: function () { ++streamNavigationGeneration; if (returnToResults) returnToResults(); }
-    });
     var saved = cachedStreams(movie, provider, item);
     withTimeout(function () {
       return saved || provider.resolve(item, movie);
     }, providerTimeout(provider), 'resolve ' + provider.id).then(function (streams) {
-      if (generation !== streamNavigationGeneration) return;
       if (!Array.isArray(streams) || !streams.length) {
-        notify('Для выбранной записи нет доступных MP4/HLS-потоков', true);
-        if (returnToResults) returnToResults();
+        notify('Для выбранной записи нет доступных MP4-потоков', true);
         return;
       }
       if (!saved) {
         recordProviderSuccess(provider, streams.length);
         rememberStreams(movie, provider, item, streams);
       }
-      showStreamOptions(streams, item, provider, movie, returnToResults, saved);
+      L.Select.show({
+        title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
+        items: streams,
+        onSelect: function (stream) { chooseStream(item, stream, movie, provider); },
+        onBack: function () { L.Controller.toggle('content'); }
+      });
     }).catch(function (err) {
-      if (generation !== streamNavigationGeneration) return;
-      recordProviderFailure(provider, err);
+      recordProviderFailure(provider);
       console.error('[VideoFinder] Resolve failed:', provider.id, err);
       notify('Не удалось получить поток. Возможны CORS/сетевая ошибка.', true);
-      if (returnToResults) returnToResults();
     });
-  }
-
-  // Lazy optional knowledge base; legacy cache remains the source of playback data.
-  var knowledge = null;
-  function knowledgeBase() {
-    if (knowledge) return knowledge;
-    var k = window.LampaVideoFinderKB;
-    if (!k || !k.observations || !k.outcomes || !k.routes || !k.profile || !k.registry || !k.budget) return null;
-    try {
-      k.budget.migrate(L.Storage);
-      knowledge = {
-        api:k, observations:k.observations.createStore(L.Storage,{maxEvents:250}),
-        routes:k.routes.createRoutes(L.Storage), registry:k.registry()
-      };
-      providers.forEach(function(p){knowledge.registry.register({id:p.id,sourceId:p.id});});
-    } catch(e) {console.warn('[PluginLampa KB] init:',e); return null;}
-    return knowledge;
-  }
-  // Lampa.Storage can be small on older Smart TVs. Budget uses UTF-8 bytes,
-  // while observation store.size() deliberately counts events.
-  function kbBytes(kb) {
-    var text = kb.observations.exportAll();
-    try {
-      return encodeURIComponent(text).replace(/%[0-9A-F]{2}/gi, 'X').length;
-    } catch (err) { return text.length * 3; }
-  }
-  function capKB(kb) {
-    var store = {
-      append: function(e) {kb.observations.append(e);},
-      exportAll: function() {return JSON.parse(kb.observations.exportAll());},
-      importAll: function(doc) {kb.observations.importAll(doc);},
-      size: function() {return kbBytes(kb);}
-    };
-    kb.api.budget.enforce(store, 65536);
-  }
-
-  function knowledgeRecord(provider,movie,err,items) {
-    var kb=knowledgeBase();
-    if(!kb)return;
-    try {
-      var count=Array.isArray(items)?items.length:0;
-      var kind=err?kb.api.outcomes.classify(err).class:(count?'FOUND':'EMPTY');
-      kb.observations.append({
-        sourceId:provider.id,class:kind,movieId:movieKey(movie),
-        method:'search',detail:'count='+count
-      });
-      capKB(kb);
-      if(kind==='FOUND'&&items[0]&&typeof items[0].sourceUrl==='string') {
-        var url=items[0].sourceUrl;
-        if((/^https:\/\/archive\.org\/details\/[A-Za-z0-9_.%-]+\/?$/.test(url) ||
-            /^https:\/\/rutube\.ru\/video\/[A-Za-z0-9_-]+\/?$/.test(url)) &&
-           url.indexOf('?')<0&&url.indexOf('#')<0) {
-          kb.routes.remember(movieKey(movie),{
-            sourceId:provider.id,page:url,method:'search',
-            checkedAt:Date.now(),persistence:'persistent'
-          });
-        }
-      }
-    } catch(e) { console.warn('[PluginLampa KB] observation:',e); }
-  }
-  function knowledgeStatus() {
-    var kb=knowledgeBase();
-    if(!kb)return {enabled:false,events:0,sources:[]};
-    var compatible={
-      recent:function(id,limit) {
-        return kb.observations.recent({sourceId:id,limit:limit}).map(function(o) {
-          return {at:o.time,class:o.class,method:o.method};
-        });
-      }
-    };
-    return {enabled:true,events:kb.observations.size(),bytes:kbBytes(kb),
-      sources:providers.map(function(p) {
-        return {id:p.id,profile:kb.api.profile.profile(compatible,p.id,Date.now())};
-      })
-    };
-  }
-
-  // Registry selects one implementation per logical source. Separate source IDs
-  // remain independent; no fallback to title-search or an unrelated catalog.
-  function registrySelection(candidates, forced, movie) {
-    var kb = knowledgeBase();
-    if (!kb || !kb.api || typeof kb.api.registry !== 'function') return candidates;
-    var registry = kb.api.registry();
-    var ids = [];
-    candidates.forEach(function (provider) {
-      var sourceId = provider.sourceId || provider.id;
-      registry.register({id:provider.id,sourceId:sourceId,provider:provider});
-      if (ids.indexOf(sourceId) === -1) ids.push(sourceId);
-    });
-    var chosen = [];
-    ids.forEach(function (sourceId) {
-      var impl = registry.choose(sourceId,function (candidate) {
-        // A fallback must support this card before it can replace the primary.
-        try {
-          if (candidate.provider.supports && !candidate.provider.supports(movie)) return -Infinity;
-        } catch (err) { return -Infinity; }
-        var h = providerHealth(candidate.provider);
-        if (forced) return 1;
-        return h.cooldownUntil > Date.now() ? -Infinity : 1;
-      });
-      if (impl && impl.provider) {
-        var hasSupported = candidates.some(function (p) {
-          if ((p.sourceId || p.id) !== sourceId) return false;
-          try { return !p.supports || p.supports(movie); } catch (err) { return false; }
-        });
-        if (hasSupported) {
-          var supported = !impl.provider.supports;
-          try { if (!supported) supported = !!impl.provider.supports(movie); } catch (err) { supported = false; }
-          if (supported) chosen.push(impl.provider);
-        } else chosen.push(impl.provider); // Preserve unsupported-source diagnostics.
-      }
-    });
-    return chosen;
   }
 
   function queryProvider(provider, movie) {
@@ -1981,11 +545,9 @@ SOFTWARE.
       'search ' + provider.id).then(function (items) {
       if (!Array.isArray(items)) throw new Error('Expected an array of candidates');
       recordProviderSuccess(provider, items.length);
-      knowledgeRecord(provider,movie,null,items);
       return { provider: provider, items: rememberCandidates(movie, provider, items), cached: false };
     }).catch(function (err) {
-      recordProviderFailure(provider, err);
-      knowledgeRecord(provider,movie,err,null);
+      recordProviderFailure(provider);
       console.error('[VideoFinder] Search failed:', provider.id, err);
       // Preserve the last good results; never cache errors as valid empty searches.
       return { provider: provider, items: cachedCandidates(movie, provider) || [],
@@ -1994,8 +556,6 @@ SOFTWARE.
   }
 
   function openResults(movie, refresh, titleSearch) {
-    // Entering another results view invalidates a pending stream resolution.
-    ++streamNavigationGeneration;
     if (!movie.title) {
       notify('В карточке нет названия фильма', true);
       return;
@@ -2003,15 +563,11 @@ SOFTWARE.
     if (busy) return;
     busy = true;
     var scope = titleSearch || 'all';
-    var selectedProviders = registrySelection(providers.filter(function (p) {
+    var selectedProviders = providers.filter(function (p) {
       return scope === 'all' || (scope === 'titles' ? !!p.titleSearch : !p.titleSearch);
-    }), refresh, movie);
+    });
     var diagnostics = [];
     var cachedGroups = refresh ? [] : selectedProviders.map(function (provider) {
-      // Respect supports() even for saved results: a disabled source must not reappear.
-      try {
-        if (provider.supports && !provider.supports(movie)) return null;
-      } catch (err) { return null; }
       var saved = cachedCandidates(movie, provider);
       return saved ? { provider: provider, items: saved, cached: true } : null;
     }).filter(Boolean);
@@ -2093,10 +649,7 @@ SOFTWARE.
       if (!results.length) {
         notify('0 результатов: открой «Диагностика источников» и проверь причины.', true);
       }
-      var menuActions = actions.filter(function (action) {
-        try { return !action.supports || action.supports(movie); }
-        catch (err) { console.warn('[VideoFinder] action supports failed:', action.id, err); return false; }
-      }).map(function (action) {
+      var menuActions = actions.map(function (action) {
         return { title: action.title, subtitle: action.subtitle || '', _actionHandler: action };
       });
       var entries = results.concat(menuActions, [
@@ -2111,8 +664,7 @@ SOFTWARE.
         { title: 'Найденные сайты (' + sourceList().length + ')',
           subtitle: 'Локально сохранённые сайты', _action: 'sources' }
       ]);
-      function showResultsMenu() {
-        L.Select.show({
+      L.Select.show({
         title: 'Видео · ' + movie.title + (networkCount === 0 ? ' · из памяти' : ''),
         items: entries,
         onSelect: function (selected) {
@@ -2130,19 +682,17 @@ SOFTWARE.
                 return {title: d.provider.name, subtitle: d.status};
               }) : [{title: 'Подключённых источников нет'}],
               onSelect: function () {},
-              onBack: showResultsMenu
+              onBack: function () { L.Controller.toggle('content'); }
             });
             return;
           }
-          if (selected._action === 'sources') { showSources(showResultsMenu); return; }
-          if (selected._action === 'providers') { showProviders(showResultsMenu); return; }
+          if (selected._action === 'sources') { showSources(); return; }
+          if (selected._action === 'providers') { showProviders(); return; }
           L.Select.close();
-          openStreams(selected._item, selected._provider, movie, showResultsMenu);
+          openStreams(selected._item, selected._provider, movie);
         },
         onBack: function () { L.Controller.toggle('content'); }
       });
-      }
-      showResultsMenu();
       if (networkCount === 0 && cacheHit) notify('Показываю сохранённые результаты');
     }).catch(function (err) {
       console.error('[VideoFinder] Unexpected search error', err);
@@ -2160,8 +710,6 @@ SOFTWARE.
     listProviders: function () { return providers.map(function (p) { return p.id; }); },
     listKnownSources: sourceList,
     listProviderHealth: providerStatuses,
-    knowledgeStatus: knowledgeStatus,
-    knownRoutes:function(card){var kb=knowledgeBase();return kb?kb.routes.routesFor(movieKey(movieInfo(card))):[];},
     clearMovieCache: function (card) { forgetMovie(movieInfo(card)); },
     clearCache: function () { cache = { version: 2, movies: {}, sites: {}, health: {} }; saveCache(); },
     cacheStats: function () { return { movies: Object.keys(cache.movies).length, sites: sourceList().length }; }
@@ -2183,7 +731,7 @@ SOFTWARE.
     Lampa.Manifest.plugins = {
       type: 'video',
       name: 'Video Finder',
-      version: '0.6.3',
+      version: '0.6.1',
       description: 'Поиск видео с локальным сохранением найденных источников',
       onContextMenu: function () {
         return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
@@ -2198,7 +746,7 @@ SOFTWARE.
       button.on('hover:enter', function () { openCard(event.data.movie); });
       container.append(button);
     });
-    console.log('[VideoFinder] Installed v0.6.3. Providers:', window.LampaVideoFinder.listProviders());
+    console.log('[VideoFinder] Installed v0.6.1. Providers:', window.LampaVideoFinder.listProviders());
   }
 
   function openCard(card) {
@@ -2239,7 +787,6 @@ SOFTWARE.
     if (event.type === 'ready') safeInit();
   });
 })();
-
 
 /*
  * PluginLampa Rutube provider (independent JS implementation, 2026-10-18).
@@ -2346,6 +893,8 @@ SOFTWARE.
   });
 })();
 
+
+
 /*
  * Stremio HTTP addon protocol adapter for PluginLampa.
  * Independent implementation based on the public protocol specification:
@@ -2368,36 +917,20 @@ SOFTWARE.
   function notify(text, error) {
     L.Noty.show(text, error ? { style: 'error', time: 5500 } : { time: 3500 });
   }
-  // Older Tizen WebViews may have no global URL constructor.
   function validHttp(raw, httpsOnly) {
     try {
       var value = String(raw || '').trim();
       if (value.indexOf('stremio://') === 0) value = 'https://' + value.slice(10);
-      if (typeof URL === 'function') {
-        var nativeUrl = new URL(value);
-        if ((httpsOnly && nativeUrl.protocol !== 'https:') ||
-            (!httpsOnly && !/^https?:$/.test(nativeUrl.protocol)) ||
-            nativeUrl.username || nativeUrl.password) return '';
-        return nativeUrl.href;
-      }
-      // Only HTTP(S), with an ordinary host, optional port and safe path/query/fragment.
-      // Reject userinfo, whitespace, backslashes and non-HTTP schemes.
-      var found = value.match(/^(https?):\/\/([a-z0-9.-]+|\[[a-f0-9:]+\])(?::([0-9]{1,5}))?(\/[^?#\\\s]*)?(\?[^#\\\s]*)?(#[^\\\s]*)?$/i);
-      if (!found || (httpsOnly && found[1].toLowerCase() !== 'https')) return '';
-      if (found[3] && Number(found[3]) > 65535) return '';
-      return found[1].toLowerCase() + '://' + found[2] +
-        (found[3] ? ':' + found[3] : '') + (found[4] || '/') +
-        (found[5] || '') + (found[6] || '');
+      var url = new URL(value);
+      if ((httpsOnly && url.protocol !== 'https:') ||
+          (!httpsOnly && !/^https?:$/.test(url.protocol)) ||
+          url.username || url.password) return '';
+      return url.href;
     } catch (_) { return ''; }
   }
   function manifestUrl(value) {
     var url = validHttp(value, true);
     if (!url) throw Error('Требуется HTTPS-адрес расширения');
-    if (typeof URL !== 'function') {
-      if (/[?#]/.test(url)) throw Error('Адрес должен оканчиваться на /manifest.json без параметров');
-      return /\/manifest\.json$/i.test(url) ? url :
-        url.replace(/\/+$/, '') + '/manifest.json';
-    }
     var parsed = new URL(url);
     if (parsed.hash || parsed.search) throw Error('Адрес должен оканчиваться на /manifest.json без параметров');
     if (!/\/manifest\.json$/i.test(parsed.pathname)) {
@@ -2601,14 +1134,11 @@ SOFTWARE.
     L.Select.close();
     L.Input.edit({ title: 'HTTPS-ссылка Stremio addon /manifest.json', value: '', free: true, nosave: true },
       function (value) {
-        if (!value) { manage(); return; }
+        if (!value) return;
         install(value).then(function (item) {
           notify('Добавлено: ' + item.name);
           manage();
-        }).catch(function (err) {
-          notify('Ошибка расширения: ' + err.message, true);
-          manage();
-        });
+        }).catch(function (err) { notify('Ошибка расширения: ' + err.message, true); });
       });
   }
   function catalog() {
@@ -2653,71 +1183,6 @@ SOFTWARE.
       }, onBack: function () { L.Controller.toggle('content'); }
     });
   }
-  function selectSeriesEpisode(movie) {
-    var imdb = String(movie.imdb_id || '');
-    if (!/^tt\d{5,12}$/.test(imdb)) {
-      notify('Нет IMDb ID сериала: выбрать серии через Stremio невозможно', true);
-      return;
-    }
-    notify('Получаю сезоны и серии из Cinemeta...');
-    // The official Stremio metadata addon supplies actual episode numbers.
-    // Do not guess a season/episode or treat an empty list as a stream failure.
-    request('https://v3-cinemeta.strem.io/meta/series/' + imdb + '.json').then(function (body) {
-      var raw = body && body.meta && body.meta.videos;
-      if (!Array.isArray(raw)) throw Error('Cinemeta не вернула список серий');
-      var seasons = Object.create(null), count = 0;
-      raw.slice(0, 2500).forEach(function (entry) {
-        if (!entry) return;
-        var season = Number(entry.season), episode = Number(entry.episode);
-        if (!Number.isInteger(season) || !Number.isInteger(episode) ||
-            season < 1 || season > 100 || episode < 1 || episode > 1000) return;
-        var key = String(season);
-        if (!seasons[key]) seasons[key] = [];
-        if (seasons[key].some(function (v) { return v.episode === episode; })) return;
-        seasons[key].push({season: season, episode: episode, title: short(entry.title || entry.name || '')});
-        count++;
-      });
-      if (!count) throw Error('В Cinemeta нет подходящих эпизодов');
-      var groups = Object.keys(seasons).sort(function (a, b) { return Number(a) - Number(b); });
-      function showSeasons() {
-        L.Select.show({
-          title: 'Stremio · сезоны · ' + movie.title,
-          items: groups.map(function (season) {
-            return {title: 'Сезон ' + season, subtitle: seasons[season].length + ' серий', _season: season};
-          }),
-          onSelect: function (selected) {
-            var episodes = seasons[selected._season];
-            if (!episodes) return;
-            episodes.sort(function (a,b){ return a.episode - b.episode; });
-            L.Select.show({
-              title: 'Сезон ' + selected._season + ' · серии',
-              items: episodes.map(function (ep) {
-                return {title: 'Серия ' + ep.episode + (ep.title ? ' · ' + ep.title : ''), _episode: ep};
-              }),
-              onSelect: function (selectedEp) {
-                var ep = selectedEp._episode;
-                if (!ep) return;
-                var card = {}, source = movie.card || {};
-                Object.keys(source).forEach(function (key) {card[key] = source[key];});
-                card.media_type = 'tv';
-                card.imdb_id = imdb;
-                card.season_number = ep.season;
-                card.episode_number = ep.episode;
-                engine.open(card);
-              },
-              onBack: showSeasons
-            });
-          },
-          onBack: function () { engine.open(movie.card || {}); }
-        });
-      }
-      showSeasons();
-    }).catch(function (err) {
-      console.warn('[VideoFinder] Cinemeta episodes failed:', err);
-      notify('Не удалось получить эпизоды Stremio: ' + (err.message || err), true);
-    });
-  }
-
   readSaved().forEach(function (addon) {
     try { addKnown(addon.url, addon.manifest); }
     catch (err) { console.warn('[VideoFinder] Ignore invalid saved Stremio addon'); }
@@ -2725,155 +1190,6 @@ SOFTWARE.
   window.LampaVideoFinderStremio = { install: install, remove: remove, list: list, manage: manage };
   engine.registerAction({ id: 'stremio-manage', title: '⚙ Stremio · расширения',
     subtitle: 'Добавить или удалить источник видео', open: manage });
-  engine.registerAction({id: 'stremio-series',
-    title: '📺 Stremio · выбрать серию',
-    subtitle: 'Сезоны и реальные эпизоды из Cinemeta',
-    supports: function (movie) {
-      return movie.media_type === 'tv' && /^tt\d{5,12}$/.test(String(movie.imdb_id || '')) &&
-        !episode(movie) && addons.some(function (a) {
-          return a.manifest.types.indexOf('series') !== -1;
-        });
-    },
-    open: selectSeriesEpisode
-  });
 })();
 
-/*
- * PluginLampa / AniLiberty experimental HTTP provider.
- * Independently written against the documented AniLiberty API v1.
- * Opt-in, disabled by default: live endpoint/CORS and Samsung Tizen playback not yet verified.
- * No tokens, cookies, DRM bypass, headless browser, or external JS.
- */
-(function () {
-  'use strict';
-  var engine = window.LampaVideoFinder;
-  var L = window.Lampa;
-  if (!engine || !L || !engine.registerProvider || !engine.registerAction) return;
-  if (engine.listProviders().indexOf('aniliberty') !== -1) return;
 
-  var BASE = 'https://anilibria.top/api/v1';
-  var KEY = 'video_finder_aniliberty_enabled_v1';
-  var MAX_RELEASES = 12;
-  var MAX_EPISODES = 60;
-  var MAX_STREAMS = 150;
-
-  function enabled() {
-    var value = L.Storage.get(KEY, false);
-    return value === true || value === 'true' || value === 1;
-  }
-  function notify(msg, error) {
-    L.Noty.show(msg, error ? {style: 'error', time: 6000} : {time: 4500});
-  }
-  function clean(text) {
-    return String(text || '').toLowerCase().replace(/[^a-z0-9\u0400-\u04ff]+/g, ' ').trim().replace(/\s+/g, ' ');
-  }
-  function sameTitle(a, b) {
-    a = clean(a); b = clean(b);
-    if (!a || !b) return false;
-    return a === b || (a.length > 9 && b.indexOf(a + ' ') === 0) ||
-      (b.length > 9 && a.indexOf(b + ' ') === 0);
-  }
-  function matching(movie, release) {
-    if (!release || !release.name || !release.id) return false;
-    var names = [release.name.main, release.name.english].filter(Boolean);
-    var wanted = [movie.title, movie.original_title].filter(Boolean);
-    if (!names.some(function (s) {
-      return wanted.some(function (t) { return sameTitle(s, t); });
-    })) return false;
-    if (movie.year && release.year && Math.abs(Number(movie.year) - Number(release.year)) > 1) return false;
-    return true;
-  }
-  function urlStream(value) {
-    var text = String(value || '');
-    // Restrict to absolute HTTPS URLs without embedded login/password or backslashes.
-    return /^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?\/[^\s\\<>]*$/i.test(text) &&
-      text.indexOf('@') < 0 ? text : '';
-  }
-  function api(path) { return engine.requestJson(BASE + path); }
-  function search(movie) {
-    if (!enabled()) return Promise.resolve([]);
-    var names = [movie.title, movie.original_title].filter(Boolean);
-    if (names.length > 1 && clean(names[0]) === clean(names[1])) names.pop();
-    if (!names.length) return Promise.resolve([]);
-    return Promise.all(names.map(function (name) {
-      return api('/app/search/releases?query=' + encodeURIComponent(name)).then(function (response) {
-        if (!Array.isArray(response)) throw Error('AniLiberty: неверный формат ответа поиска');
-        return {ok: true, rows: response.slice(0, 60)};
-      }).catch(function (error) {
-        console.warn('[AniLiberty] Search request failed', error);
-        return {ok: false, rows: []};
-      });
-    })).then(function (groups) {
-      if (!groups.some(function (g) { return g.ok; })) {
-        throw Error('AniLiberty: API недоступен или запрос заблокирован');
-      }
-      var unique = Object.create(null);
-      groups.forEach(function (group) {
-        group.rows.forEach(function (release) {
-          if (!matching(movie, release) || !/^\d{1,12}$/.test(String(release.id))) return;
-          var id = String(release.id);
-          if (unique[id]) return;
-          unique[id] = {
-            id: id,
-            title: String(release.name.main || release.name.english),
-            subtitle: 'AniLiberty · аниме' + (release.year ? ' · ' + release.year : ''),
-            sourceUrl: 'https://anilibria.top/anime/releases/release/' + id,
-            confidence: 85
-          };
-        });
-      });
-      return Object.keys(unique).slice(0, MAX_RELEASES).map(function (id) { return unique[id]; });
-    });
-  }
-  function resolve(item) {
-    if (!item || !/^\d{1,12}$/.test(String(item.id || ''))) {
-      return Promise.reject(Error('AniLiberty: неверный ID релиза'));
-    }
-    return api('/anime/releases/' + encodeURIComponent(String(item.id))).then(function (release) {
-      var episodes = release && release.episodes;
-      if (!Array.isArray(episodes)) return [];
-      var streams = [];
-      episodes.slice(0, MAX_EPISODES).forEach(function (episode) {
-        if (!episode) return;
-        var ordinal = String(episode.ordinal || episode.number || '');
-        var caption = 'Серия ' + ordinal + (episode.name ? ' · ' + String(episode.name).slice(0, 75) : '');
-        [['1080p',episode.hls_1080],['720p',episode.hls_720],['480p',episode.hls_480]]
-          .forEach(function (quality) {
-            var url = urlStream(quality[1]);
-            if (url && streams.length < MAX_STREAMS) streams.push({
-              title: caption + ' · ' + quality[0],
-              subtitle: 'AniLiberty · HLS ' + quality[0],
-              episodeNumber: ordinal,
-              episodeTitle: caption,
-              quality: quality[0],
-              url: url
-            });
-          });
-      });
-      return streams;
-    });
-  }
-  engine.registerProvider({
-    id: 'aniliberty',
-    name: 'AniLiberty (эксперимент)',
-    siteUrl: 'https://anilibria.top',
-    titleSearch: true,
-    timeoutMs: 12000,
-    persistStreams: false,
-    supports: function (movie) { return enabled() && !!movie.title; },
-    unavailableReason: function () { return 'Выключен. Включи через пункт ⚙ AniLiberty в меню результатов.'; },
-    search: search,
-    resolve: resolve
-  });
-  engine.registerAction({
-    id: 'aniliberty-toggle',
-    title: '⚙ AniLiberty · аниме (эксперимент)',
-    subtitle: 'Включить/выключить отдельный API-источник, пока не проверенный на Tizen',
-    open: function () {
-      var on = !enabled();
-      L.Storage.set(KEY, on);
-      notify('AniLiberty ' + (on ? 'включён' : 'выключен') +
-        '. Нажми ↻ Обновить поиск, чтобы применить изменение.');
-    }
-  });
-})();
