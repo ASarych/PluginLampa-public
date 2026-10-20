@@ -1,4 +1,4 @@
-// PluginLampa v0.6.3 · Archive + Rutube + Stremio + AniLiberty + KB.
+// PluginLampa v0.6.4 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
 /*
@@ -1399,6 +1399,33 @@ SOFTWARE.
     return 5;
   }
 
+  // Internet Archive exposes its own metadata. Only an exact IMDb cross-reference
+  // may promote a title discovery hit into a watch variant; names alone never do.
+  function archiveIdentity(item, movie) {
+    var imdb = String(movie.imdb_id || '');
+    if (!/^tt[0-9]{5,12}$/.test(imdb) || !/^[a-zA-Z0-9_.-]{1,128}$/.test(item.id)) {
+      return Promise.resolve(item);
+    }
+    return httpJson('https://archive.org/metadata/' + encodeURIComponent(item.id)).then(function (data) {
+      var metadata = data && data.metadata || {};
+      var links = metadata['external-identifier'] || metadata.external_identifier || metadata.imdb || [];
+      if (!Array.isArray(links)) links = [links];
+      var matched = links.some(function (link) {
+        var text = String(link || '').trim();
+        return text === imdb || text === 'urn:imdb:' + imdb ||
+          text === 'imdb:' + imdb || text === 'https://www.imdb.com/title/' + imdb ||
+          text === 'https://www.imdb.com/title/' + imdb + '/';
+      });
+      // Require an ordinary downloadable movie file, not just an IMDb reference.
+      var files = data && data.files;
+      var downloadable = Array.isArray(files) && files.slice(0, 1000).some(function (f) {
+        return f && /\.mp4$/i.test(String(f.name || '')) && f.private !== true && f.private !== 'true';
+      });
+      if (matched && downloadable) item.verifiedMediaId = imdb;
+      return item;
+    }).catch(function () { return item; });
+  }
+
   function searchArchiveTitle(title, movie) {
     // Query public Archive catalog. Its metadata can contain unrelated or
     // incomplete entries, so results are candidates, not verified matches.
@@ -1413,17 +1440,28 @@ SOFTWARE.
       if (!Array.isArray(documents)) throw new Error('Archive: неверный формат ответа поиска');
       return documents.filter(function (document) {
         if (!document || !document.identifier || !document.title) return false;
-        if (movie.year && document.year && String(movie.year) !== String(document.year)) return false;
-        return rankMatch(document.title, movie) >= 60;
+        if (/\b(trailer|teaser|review|reaction|recap|clip|preview)\b|трейлер|тизер|обзор|реакция|нарезк|анонс/i.test(String(document.title))) return false;
+        if (movie.year && String(movie.year) !== String(document.year || '')) return false;
+        var candidateTitle = normalize(document.title);
+        if (movie.year) candidateTitle = normalize(candidateTitle.replace(new RegExp('(^| )' + String(movie.year) + '(?= |$)', 'g'), ' '));
+        return [normalize(movie.title), normalize(movie.original_title)].filter(Boolean).indexOf(candidateTitle) !== -1;
       }).map(function (document) {
         return {
           id: String(document.identifier),
+          matchVersion: 2,
           sourceUrl: 'https://archive.org/details/' + encodeURIComponent(document.identifier),
           title: String(document.title),
           subtitle: (document.year ? String(document.year) + ' · ' : '') + 'Internet Archive',
           confidence: rankMatch(document.title, movie)
         };
-      });
+      }).slice(0, 6).reduce(function (promise, item) {
+        return promise.then(function (out) {
+          return archiveIdentity(item, movie).then(function (result) {
+            out.push(result);
+            return out;
+          });
+        });
+      }, Promise.resolve([]));
     });
   }
 
@@ -1458,6 +1496,18 @@ SOFTWARE.
   function resolveArchive(item) {
     var url = 'https://archive.org/metadata/' + encodeURIComponent(item.id);
     return httpJson(url).then(function (payload) {
+      // A saved cross-reference can change: revalidate identity at resolve time.
+      if (item.verifiedMediaId) {
+        var md = payload && payload.metadata || {};
+        var refs = md['external-identifier'] || md.external_identifier || md.imdb || [];
+        if (!Array.isArray(refs)) refs = [refs];
+        if (!refs.some(function (v) {
+          var value = String(v || '').trim(), id = item.verifiedMediaId;
+          return value === id || value === 'imdb:' + id || value === 'urn:imdb:' + id ||
+            value === 'https://www.imdb.com/title/' + id ||
+            value === 'https://www.imdb.com/title/' + id + '/';
+        })) return [];
+      }
       var files = payload && payload.files;
       if (!Array.isArray(files)) throw new Error('Archive: неверный формат файлов метаданных');
       // Extremely large metadata records should not freeze TV menu rendering.
@@ -1640,6 +1690,10 @@ SOFTWARE.
     var record = getMovieEntry(movie, false);
     var entry = record && record.providers[provider.id];
     if (!entry || !Array.isArray(entry.items) || !entry.items.length) return null;
+      if (provider.id === 'archive') {
+        var verified = entry.items.filter(function (item) { return item && item.matchVersion === 2; });
+        return verified.length ? verified : null;
+      }
     return entry.items;
   }
 
@@ -2095,7 +2149,7 @@ SOFTWARE.
     });
   }
 
-  function openResults(movie, refresh, titleSearch) {
+  function openResults(movie, refresh, titleSearch, returnTarget) {
     // Any direct search supersedes an unresolved IMDb lookup.
     ++movieLookupRevision;
     if (movieLookupTimer !== null) clearTimeout(movieLookupTimer);
@@ -2108,7 +2162,7 @@ SOFTWARE.
       if (activeNativePage && activeNativePage.isAlive()) displayMenu({
         title: 'PluginLampa · Ошибка',
         items: [{title:'Нет названия фильма', subtitle:'Нажми Назад для возврата'}],
-        onSelect: function () {}, onBack: exitResults
+        onSelect: function () {}, onBack: typeof returnTarget === 'function' ? returnTarget : exitResults
       });
       return;
     }
@@ -2191,14 +2245,83 @@ SOFTWARE.
     tasks.then(function (groups) {
       // A newer card, refresh or mode selection owns the menu.
       if (navigation !== resultsNavigationGeneration) return;
+      // Playback variants are admitted only with a provider-verified media key.
+      // Archive/Rutube title matches remain searchable for diagnostics, never
+      // masquerade as the selected movie in the main playback list.
+      function watchVariant(provider, item) {
+        if (!provider || !item || typeof item !== 'object') return null;
+        if (provider.id === 'archive' && movie.media_type !== 'tv' &&
+            /^tt[0-9]{5,12}$/.test(String(movie.imdb_id || '')) &&
+            item.verifiedMediaId === String(movie.imdb_id)) {
+          return {sourceId:'archive',mediaId:item.verifiedMediaId,
+            title:movie.title,translation:'',quality:'',original:true,providerItem:item};
+        }
+        if (provider.id === 'collaps-direct') {
+          var ck = String(item.lookup || ''), c = movie.card || {};
+          var kp = String(c.kinopoisk_id || c.kp_id || '');
+          var valid = ck === 'imdb/' + String(movie.imdb_id || '') &&
+            /^tt\d{5,12}$/.test(String(movie.imdb_id || ''));
+          if (!valid) valid = ck === 'kp/' + kp && /^[1-9]\d{2,9}$/.test(kp);
+          var suffix = '', episode = null;
+          if (movie.media_type === 'tv') {
+            var sn=Number(c.season_number || c.season), en=Number(c.episode_number || c.episode);
+            if (!Number.isInteger(sn)||!Number.isInteger(en)||sn<1||en<1) return null;
+            suffix=':'+sn+':'+en;
+            episode=[sn,en];
+          }
+          if (!valid || item.videoId !== ck+suffix ||
+              item.mediaType !== (episode?'series':'movie') ||
+              (episode && (!Array.isArray(item.seasonEpisode) ||
+              +item.seasonEpisode[0]!==episode[0] || +item.seasonEpisode[1]!==episode[1]))) return null;
+          return {sourceId:provider.id,mediaId:item.videoId,title:movie.title,
+            translation:String(item.translation||''),quality:String(item.quality||''),
+            original:!item.translation,providerItem:item};
+        }
+        if (provider.id.indexOf('stremio:') !== 0) return null;
+        var key = String(item.videoId || '');
+        var imdb = String(movie.imdb_id || '');
+        var tmdb = String(movie.tmdb_id || '');
+        var series = movie.media_type === 'tv';
+        if (item.mediaType !== (series ? 'series' : 'movie')) return null;
+        var suffix = '';
+        if (series) {
+          var card = movie.card || {};
+          var season = Number(card.season_number || card.season || 0);
+          var episode = Number(card.episode_number || card.episode || 0);
+          if (!Number.isInteger(season) || !Number.isInteger(episode) ||
+              season < 1 || episode < 1) return null;
+          suffix = ':' + season + ':' + episode;
+        }
+        // Full ID equality prevents a neighbouring episode or a prefix collision
+        // from masquerading as the selected movie or series episode.
+        var accepted = !!(imdb && key === imdb + suffix) ||
+          !!(tmdb && key === 'tmdb:' + tmdb + suffix);
+        if (!accepted) return null;
+        var description = String(item.subtitle || '');
+        var quality = String(item.quality || '');
+        if (!quality) {
+          var match = description.match(/(?:^|\\W)(2160p|1080p|720p|480p|4k)(?:$|\\W)/i);
+          if (match) quality = match[1];
+        }
+        var translation = String(item.translation || '');
+        var title = movie.title;
+        return {
+          sourceId: provider.id, mediaId: key,
+          title: title, translation: translation, quality: quality,
+          original: !translation, providerItem: item
+        };
+      }
       var results = [];
       groups.forEach(function (group) {
         group.items.forEach(function (item) {
+          var variant = watchVariant(group.provider, item);
+          if (!variant) return;
           results.push({
-            title: item.title || 'Видео',
-            subtitle: (item.subtitle ? item.subtitle + ' · ' : '') + group.provider.name +
-              (group.provider.titleSearch ? ' · совпадение по названию (проверь)' : '') +
+            title: variant.title,
+            subtitle: (variant.translation ? variant.translation + ' · ' : '') +
+              (variant.quality ? variant.quality + ' · ' : '') + group.provider.name +
               (group.cached ? ' · сохранено' : ''),
+            _watchVariant: variant,
             _item: item,
             _provider: group.provider,
             _rank: Number(item.confidence) || 0
@@ -2207,7 +2330,11 @@ SOFTWARE.
       });
       results.sort(function (a, b) { return b._rank - a._rank; });
 
-      if (!results.length) {
+      var installedOnlineAvailable = L.Manifest && Array.isArray(L.Manifest.plugins) &&
+        L.Manifest.plugins.some(function (plugin) {
+          return plugin && plugin.component === 'online_mod' && typeof plugin.onContextLauch === 'function';
+        });
+      if (!results.length && !installedOnlineAvailable) {
         notify('0 результатов: открой «Диагностика источников» и проверь причины.', true);
       }
       var menuActions = actions.filter(function (action) {
@@ -2273,10 +2400,10 @@ SOFTWARE.
             return;
           }
           if (selected._actionHandler) { selected._actionHandler.open(movie); return; }
-          if (selected._action === 'refresh') { closeMenu(); openResults(movie, true, titleSearch); return; }
+          if (selected._action === 'refresh') { closeMenu(); openResults(movie, true, titleSearch, returnTarget); return; }
           if (selected._action === 'titles') {
             closeMenu();
-            openResults(movie, false, scope === 'all' ? 'exact' : scope === 'exact' ? 'titles' : 'all');
+            openResults(movie, false, scope === 'all' ? 'exact' : scope === 'exact' ? 'titles' : 'all', returnTarget);
             return;
           }
           if (selected._action === 'diagnostics') {
@@ -2301,7 +2428,8 @@ SOFTWARE.
           if (resultPage > 0) {
             resultPage--;
             showResultsMenu();
-          } else exitResults();
+          } else if (typeof returnTarget === 'function') returnTarget();
+          else exitResults();
         }
       });
       }
@@ -2323,14 +2451,18 @@ SOFTWARE.
   window.LampaVideoFinder = {
     requestJson: httpJson,
     displayMenu: displayMenu,
+    returnToViewing: function () {
+      if (activeNativePage && activeNativePage.isAlive() && activeNativePage.returnToViewing) activeNativePage.returnToViewing();
+      else L.Controller.toggle('content');
+    },
     closeMenu: closeMenu,
     attachNativePage: attachNativePage,
     detachNativePage: detachNativePage,
     searchCard: function (card) { openCard(card); },
     nativePageActive: function () { return !!activeNativePage; },
-    open: function (card) {
+    open: function (card, returnTarget) {
       if (!activeNativePage && openNativePage(card)) return;
-      openResults(movieInfo(card));
+      openResults(movieInfo(card), false, undefined, returnTarget);
     },
     // Extensions can reject late responses after another card takes focus.
     navigationGeneration: function () { return resultsNavigationGeneration; },
@@ -2363,7 +2495,7 @@ SOFTWARE.
     Lampa.Manifest.plugins = {
       type: 'video',
       name: 'Video Finder',
-      version: '0.6.3',
+      version: '0.6.4',
       description: 'Поиск видео с локальным сохранением найденных источников',
       onContextMenu: function () {
         return { name: 'Найти видео (Video Finder)', description: 'Сначала сохранённое, затем поиск' };
@@ -2386,7 +2518,7 @@ SOFTWARE.
     } catch (err) {
       console.warn('[PluginLampa] Optional full-card hook unavailable', err);
     }
-    console.log('[VideoFinder] Installed v0.6.3. Providers:', window.LampaVideoFinder.listProviders());
+    console.log('[VideoFinder] Installed v0.6.4. Providers:', window.LampaVideoFinder.listProviders());
   }
 
   function openCard(card) {
@@ -2466,6 +2598,7 @@ SOFTWARE.
     }
   }
 })();
+
 
 
 /*
@@ -2767,6 +2900,18 @@ SOFTWARE.
     }
     return direct;
   }
+  function explicitVariantMetadata(stream) {
+    var label = short(stream.name || stream.title || stream.description || '');
+    var match = label.match(/(?:^|[^a-z0-9])(2160p|1080p|720p|480p|4k|uhd|fhd)(?:[^a-z0-9]|$)/i);
+    var hints = stream.behaviorHints || {};
+    var language = '';
+    if (Array.isArray(hints.audioLanguages)) {
+      language = hints.audioLanguages.filter(function (x) {
+        return typeof x === 'string' && /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(x);
+      }).slice(0, 5).join(', ');
+    }
+    return { quality: match ? match[1].toUpperCase() : '', translation: language };
+  }
   function makeProvider(addon) {
     return {
       id: addon.providerId, name: 'Stremio · ' + addon.manifest.name,
@@ -2796,6 +2941,8 @@ SOFTWARE.
               id: key.type + ':' + key.id + ':' + index,
               signature: JSON.stringify([stream.name || '', stream.title || '', stream.description || '']), index: index, videoId: key.id, mediaType: key.type,
               title: title, subtitle: short(stream.description || stream.title || 'Stremio'),
+              quality: explicitVariantMetadata(stream).quality,
+              translation: explicitVariantMetadata(stream).translation,
               sourceUrl: addon.url, confidence: 90
             };
           });
@@ -2935,11 +3082,14 @@ SOFTWARE.
             }
             manage();
           }, onBack: manage });
-      }, onBack: function () { L.Controller.toggle('content'); }
+      }, onBack: function () {
+        if (typeof engine.returnToViewing === 'function') engine.returnToViewing();
+        else L.Controller.toggle('content');
+      }
     });
   }
   var episodeMenuGeneration = 0;
-  function selectSeriesEpisode(movie) {
+  function selectSeriesEpisode(movie, autoFirstSeason) {
     var menuGeneration = ++episodeMenuGeneration;
     var cardGeneration = typeof engine.navigationGeneration === 'function' ?
       engine.navigationGeneration() : null;
@@ -2975,7 +3125,7 @@ SOFTWARE.
       var groups = Object.keys(seasons).sort(function (a, b) { return Number(a) - Number(b); });
       function showSeasons() {
         if (!current()) return;
-        engine.displayMenu({
+        var seasonMenu = {
           title: 'Stremio · сезоны · ' + movie.title,
           items: groups.map(function (season) {
             return {title: 'Сезон ' + season, subtitle: seasons[season].length + ' серий', _season: season};
@@ -2985,8 +3135,10 @@ SOFTWARE.
             var episodes = seasons[selected._season];
             if (!episodes) return;
             episodes.sort(function (a,b){ return a.episode - b.episode; });
-            engine.displayMenu({
+            function showEpisodes() { engine.displayMenu({
               title: 'Сезон ' + selected._season + ' · серии',
+              _nativeSeason: selected._season,
+              _nativeShowSeasons: showSeasons,
               items: episodes.map(function (ep) {
                 return {title: 'Серия ' + ep.episode + (ep.title ? ' · ' + ep.title : ''), _episode: ep};
               }),
@@ -3000,21 +3152,38 @@ SOFTWARE.
                 card.imdb_id = imdb;
                 card.season_number = ep.season;
                 card.episode_number = ep.episode;
-                engine.open(card);
+                if (window.LampaVideoFinderNativePage &&
+                    typeof window.LampaVideoFinderNativePage.selectEpisode === 'function') {
+                  window.LampaVideoFinderNativePage.selectEpisode(ep.season, ep.episode);
+                }
+                engine.open(card, function () {
+                  // Core invokes this only for the active results generation.
+                  cardGeneration = typeof engine.navigationGeneration === 'function' ? engine.navigationGeneration() : null;
+                  if (current()) showEpisodes();
+                });
               },
               onBack: showSeasons
-            });
+            }); }
+            showEpisodes();
           },
           onBack: function () {
             if (current()) engine.open(movie.card || {});
           }
-        });
+        };
+        var preferred = String((movie.card || {}).season_number || (movie.card || {}).season || '');
+        if (autoFirstSeason && groups.length) seasonMenu.onSelect({_season:groups.indexOf(preferred) !== -1 ? preferred : groups[0]});
+        else engine.displayMenu(seasonMenu);
       }
       showSeasons();
     }).catch(function (err) {
       if (!current()) return;
       console.warn('[VideoFinder] Cinemeta episodes failed:', err);
       notify('Не удалось получить эпизоды Stremio: ' + (err.message || err), true);
+      engine.displayMenu({
+        title:'Серии недоступны',
+        items:[{title:'Список серий не получен',subtitle:short(err.message || err)}],
+        onSelect:function () {}, onBack:function () { engine.open(movie.card || {}); }
+      });
     });
   }
 
@@ -3022,22 +3191,146 @@ SOFTWARE.
     try { addKnown(addon.url, addon.manifest, false); }
     catch (err) { console.warn('[VideoFinder] Ignore invalid saved Stremio addon'); }
   });
-  window.LampaVideoFinderStremio = { install: install, remove: remove, list: list, manage: manage };
+  window.LampaVideoFinderStremio = { install: install, remove: remove, list: list, manage: manage,
+    openFirstSeason: function (card) {
+      card = card || {};
+      if (!/^tt\d{5,12}$/.test(String(card.imdb_id || ''))) return false;
+      selectSeriesEpisode({title:String(card.title || card.name || ''), imdb_id:String(card.imdb_id),
+        media_type:'tv',card:card}, true);
+      return true;
+    }
+  };
   engine.registerAction({ id: 'stremio-manage', title: '⚙ Stremio · расширения',
     subtitle: 'Добавить или удалить источник видео', open: manage });
   engine.registerAction({id: 'stremio-series',
     title: '📺 Stremio · выбрать серию',
     subtitle: 'Сезоны и реальные эпизоды из Cinemeta',
     supports: function (movie) {
-      return movie.media_type === 'tv' && /^tt\d{5,12}$/.test(String(movie.imdb_id || '')) &&
-        !episode(movie) && addons.some(function (a) {
-          return a.manifest.types.indexOf('series') !== -1;
-        });
+      return movie.media_type === 'tv' && /^tt\d{5,12}$/.test(String(movie.imdb_id || ''));
     },
     open: selectSeriesEpisode
   });
 })();
 
+/* Opt-in Collaps direct HLS. HTTP-origin only, no proxy or URL persistence. */
+(function(){
+'use strict';
+var L=window.Lampa,E=window.LampaVideoFinder;
+if(!L||!E||!E.registerProvider)return;
+var KEY='video_finder_collaps_enabled_v1';
+function enabled(){try{return L.Storage.get(KEY,false)===true;}catch(_){return false;}}
+function key(m){var c=m.card||{},kp=String(c.kinopoisk_id||c.kp_id||'');
+ if(/^[1-9]\d{2,9}$/.test(kp))return 'kp/'+kp;
+ return /^tt\d{5,12}$/.test(String(m.imdb_id||''))?'imdb/'+m.imdb_id:'';}
+function ep(m){var c=m.card||{},s=Number(c.season_number||c.season),n=Number(c.episode_number||c.episode);
+ return Number.isInteger(s)&&Number.isInteger(n)&&s>0&&n>0?[s,n]:null;}
+function safe(url){return typeof url==='string'&&url.length<4096&&
+ /^https?:\/\/[a-z0-9.-]+(?::\d{1,5})?(?:\/|$)/i.test(url)&&
+ !/^https?:\/\/(?:localhost|127\.|0\.0\.0\.0)/i.test(url)?url:'';}
+// Parse a bounded JSON-like object literal without executing page scripts.
+// Unknown expressions, template strings, functions, identifiers as values fail closed.
+function literal(src){
+ var i=0,nodes=0,depth=0;
+ function ws(){while(/\s/.test(src.charAt(i)))i++;}
+ function str(){var q=src.charAt(i++),out='';
+  while(i<src.length){var c=src.charAt(i++);
+   if(c===q)return out;
+   if(c==='\\'){var x=src.charAt(i++);
+    if(x==='n')c='\n';else if(x==='r')c='\r';else if(x==='t')c='\t';
+    else if(x==='u'){var h=src.slice(i,i+4);if(!/^[a-f0-9]{4}$/i.test(h))throw Error('escape');c=String.fromCharCode(parseInt(h,16));i+=4;}
+    else if(/['"\\\/]/.test(x))c=x;else throw Error('escape');}
+   out+=c;if(out.length>4096)throw Error('string size');}
+  throw Error('string end');}
+ function val(){ws();if(++depth>32||++nodes>12000)throw Error('size');
+  var c=src.charAt(i),v;
+  if(c==='"'||c==="'")v=str();
+  else if(c==='{'||c==='['){
+   var object=c==='{';i++;v=object?Object.create(null):[];ws();
+   while(src.charAt(i)!==(object?'}':']')){
+    if(i>=src.length)throw Error('end');
+    var k;
+    if(object){c=src.charAt(i);
+     if(c==='"'||c==="'")k=str();
+     else{var m=/^[a-zA-Z_$][a-zA-Z_$0-9]*/.exec(src.slice(i));if(!m)throw Error('key');k=m[0];i+=k.length;}
+     ws();if(src.charAt(i++)!==':')throw Error('colon');}
+    var x=val();if(object){if(k!=='__proto__'&&k!=='constructor')v[k]=x;}else v.push(x);
+    ws();if(src.charAt(i)===','){i++;ws();if(src.charAt(i)===(object?'}':']'))break;}
+    else if(src.charAt(i)!==(object?'}':']'))throw Error('separator');
+   }i++;
+  }else{
+   var a=/^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)(?![a-zA-Z0-9_$])/.exec(src.slice(i));
+   if(!a)throw Error('executable expression');i+=a[0].length;
+   v=a[0]==='true'?true:a[0]==='false'?false:a[0]==='null'?null:Number(a[0]);
+  }depth--;return v;}
+ var v=val();ws();if(i!==src.length)throw Error('trailing');return v;
+}
+function parse(html){
+ if(typeof html!=='string'||html.length>600000)return null;
+ var m=/makePlayer\s*\(\s*\{/.exec(html);if(!m)return null;
+ var start=html.indexOf('{',m.index),depth=0,quote='',esc=false;
+ for(var i=start;i<html.length;i++){
+  var c=html.charAt(i);
+  if(quote){if(esc)esc=false;else if(c==='\\')esc=true;else if(c===quote)quote='';continue;}
+  if(c==='"'||c==="'"){quote=c;continue;}
+  if(c==='{')depth++;
+  else if(c==='}'&&--depth===0){try{return literal(html.slice(start,i+1));}catch(_){return null;}}
+ }return null;
+}
+function url(path){return typeof location!=='undefined'&&location.protocol==='http:'?
+ 'http://api.nextembed.ws/embed/'+path:'';}
+function fetchHtml(path){var target=url(path);if(!target)return Promise.reject(Error('Collaps needs HTTP-origin; HTTPS will not be downgraded'));
+ return new Promise(function(ok,fail){try{var req=new L.Reguest();req.timeout(12000);
+ req.silent(target,function(html){ok(String(html||''));},function(xhr,kind){
+   // Some older Lampa.Reguest builds may report a JSON parsererror on a
+   // successful HTML 200 response. Accept only actual HTML with makePlayer.
+   var body=xhr&&xhr.responseText, status=Number(xhr&&xhr.status);
+   if(status===200 && typeof body==='string' && body.indexOf('makePlayer(')!==-1){
+     ok(body);return;
+   }
+   fail(Error('Collaps '+(kind==='parsererror'?'HTML parse':'HTTP')+' '+(status||0)));
+  },false,{dataType:'text'});
+ }catch(e){fail(e);}});}
+function tracks(data,m){
+ var found=[],episode=ep(m);
+ if(episode&&data&&data.playlist&&Array.isArray(data.playlist.seasons)){
+  data.playlist.seasons.forEach(function(season){if(+season.season!==episode[0]||!Array.isArray(season.episodes))return;
+   season.episodes.forEach(function(x){if(+x.episode===episode[1])found.push(x);});});
+ }else if(!episode&&data&&data.source)found.push(data.source);
+ return found.map(function(x,i){
+  var u=safe(x.hls||''),audio=x.audio||{};
+  if(!u)return null;
+  var lang=Array.isArray(audio.names)?audio.names.filter(function(n){return typeof n==='string'&&n!=='delete';}).join(', ').slice(0,100):'';
+  return {id:String(i),title:episode?'Серия '+episode[1]:String(data.title||m.title||'Видео').slice(0,100),
+   translation:lang,quality:'',url:u};
+ }).filter(Boolean);
+}
+function search(m){
+ var k=key(m);if(!k)return Promise.resolve([]);
+ return fetchHtml(k).then(function(h){var data=parse(h);if(!data)throw Error('Collaps makePlayer format unsupported');
+  return tracks(data,m).map(function(v){return {id:v.id,title:v.title,translation:v.translation,quality:v.quality,
+   mediaType:ep(m)?'series':'movie',videoId:k+(ep(m)?':'+ep(m).join(':'):''),
+   lookup:k,seasonEpisode:ep(m),confidence:95};});
+ });
+}
+function resolve(item){
+ var k=String(item.lookup||'');
+ if(!/^(?:kp\/[1-9]\d{2,9}|imdb\/tt\d{5,12})$/.test(k))return Promise.resolve([]);
+ var sn=item.seasonEpisode;
+ var m={title:item.title,imdb_id:k.slice(5),card:sn?{season_number:sn[0],episode_number:sn[1]}:{}};
+ return fetchHtml(k).then(function(h){var data=parse(h);if(!data)return [];
+  return tracks(data,m).filter(function(v){return v.id===item.id;})
+   .map(function(v){return {title:v.title,subtitle:v.quality,url:v.url};});
+ });
+}
+E.registerProvider({id:'collaps-direct',name:'Collaps · HLS',persistStreams:false,titleSearch:false,
+ supports:function(m){return enabled()&&!!url(key(m))&&!!key(m)&&(m.media_type!=='tv'||!!ep(m));},
+ unavailableReason:function(){return 'Нужен реальный Kinopoisk или IMDb ID и HTTP-origin';},
+ search:search,resolve:resolve});
+E.registerAction({id:'collaps-toggle',title:'Collaps · экспериментальный HTTP-источник',
+ subtitle:'Включить/выключить; не работает на HTTPS-origin',
+ open:function(){try{L.Storage.set(KEY,!enabled());L.Noty.show('Collaps '+(enabled()?'включён':'выключен'));}catch(_){}}});
+window.PluginLampaCollapsParser={parse:parse};
+})();
 /*
  * PluginLampa / AniLiberty experimental HTTP provider.
  * Independently written against the documented AniLiberty API v1.
@@ -3200,15 +3493,31 @@ SOFTWARE.
     var self = this;
     var scroll = new L.Scroll({ mask: true, over: true });
     var content = jq('<div class="pluginlampa-native-page" style="padding:1.5em 2em 4em"></div>');
-    var heading = jq('<div style="font-size:1.6em;margin-bottom:1em"></div>');
+    var heading = jq('<div class="pluginlampa-heading"></div>');
+    var sidebar = jq('<div class="pluginlampa-sidebar"></div>');
+    var main = jq('<div class="pluginlampa-main"></div>');
+    var toolbar = jq('<div class="pluginlampa-toolbar"></div>');
     var rows = jq('<div class="pluginlampa-native-rows"></div>');
     var style = jq('<style>' +
-      '.pluginlampa-native-page{padding:1.3em 2em 4em}' +
+      '.pluginlampa-native-page{display:flex;gap:2em;padding:1.3em;height:100%;box-sizing:border-box}' +
+      '.pluginlampa-sidebar{width:24%;flex-shrink:0;padding-top:.3em;overflow-wrap:break-word}' +
+      '.pluginlampa-main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}' +
+      '.pluginlampa-main>.scroll{flex:1;min-height:0}' +
+      '.pluginlampa-poster{width:7em;max-height:11em;object-fit:cover;border-radius:.3em;margin-bottom:1em}' +
+      '.pluginlampa-film-title{font-size:1.6em;font-weight:bold;margin:.4em 0}' +
+      '.pluginlampa-film-info{opacity:.75;font-size:.85em;margin:.5em 0;line-height:1.5}' +
+      '.pluginlampa-heading{font-size:1.05em;opacity:.7;margin:.8em 0}' +
+      '.pluginlampa-native-rows{padding:.5em .65em}' +
+      '.pluginlampa-toolbar{display:flex;gap:.6em;flex-wrap:wrap;margin-bottom:1em}' +
+      '.pluginlampa-control{padding:.7em 1em;background:rgba(0,0,0,.25);border-radius:.3em}' +
+      '.pluginlampa-control.focus{outline:.17em solid #fff;background:rgba(255,255,255,.2)}' +
+      '@media(max-width:600px){.pluginlampa-native-page{display:block}.pluginlampa-sidebar{width:auto}.pluginlampa-poster{display:none}.pluginlampa-film-description{display:none}}' +
       '.pluginlampa-native-page .online{margin-bottom:.45em}' +
       '.pluginlampa-native-page .online__body{padding:.9em 1.1em}' +
       '.pluginlampa-native-page .pluginlampa-selected .online__body{' +
-      'background:rgba(255,255,255,.22);outline:.17em solid #fff;' +
+      'background:rgba(255,255,255,.22);' +
       'border-radius:.3em}' +
+      '.pluginlampa-native-page .pluginlampa-selected:not(.focus) .online__body{outline:.17em solid #fff}' +
       '.pluginlampa-native-page .pluginlampa-section{' +
       'font-weight:bold;font-size:1.12em;opacity:.85;padding:.85em 0 .35em}' +
       '</style>');
@@ -3218,11 +3527,76 @@ SOFTWARE.
     var selectedIndex = 0;
     var menu = null;
     var chosenSource = null;
+    var chosenQuality = '';
+    var chosenTranslation = '';
+    var rootMenu = null;
+    var settingsMenu = null;
+    var firstSeriesOpened = false;
+    var selectedEpisode = null;
     var page = 0;
     var generation = 0;
     var alive = true;
     var started = false;
+    var controller = null;
+    var installTimer = null;
     var movie = activityData.movie || {};
+
+    function installedChoices() {
+      var installed = L.Manifest && L.Manifest.plugins;
+      if (!Array.isArray(installed)) return [];
+      return installed.filter(function (plugin) {
+        return plugin && plugin.type === 'video' && plugin.component === 'online_mod' &&
+          typeof plugin.onContextLauch === 'function';
+      }).map(function (plugin) {
+        return {title:plugin.name || 'Онлайн Мод',
+          subtitle:'Установленный плагин · открыть его источники и переводы',
+          _nativeInstalledPlugin:plugin};
+      });
+    }
+
+    function openInstalled(plugin) {
+      try { plugin.onContextLauch(movie); }
+      catch (err) {
+        console.warn('[PluginLampa] Installed online plugin failed', err);
+        if (L.Noty && L.Noty.show) L.Noty.show('Не удалось открыть установленный Онлайн Мод');
+      }
+    }
+
+    function installOnline(root) {
+      var url = 'https://nb557.github.io/plugins/online_mod.js';
+      var existing = L.Plugins.get().filter(function (plugin) { return plugin.url === url; })[0];
+      if (existing) {
+        renderMenu({title:'Онлайн Мод уже добавлен',items:[{title:'Перезапустить Lampa',
+          subtitle:'Для завершения загрузки установленного плагина',_restart:true}],
+          onSelect:function (item) { if (item._restart) window.location.reload(); },
+          onBack:function () { self.showMenu(root); }});
+        return;
+      }
+      try { L.Plugins.add({url:url,status:1,name:'Онлайн Мод',author:'@nb557'}); }
+      catch (err) {
+        renderMenu({title:'Не удалось подключить Онлайн Мод',items:[{title:'Попробуй ещё раз через настройки расширений Lampa'}],
+          onBack:function () { self.showMenu(root); }});
+        return;
+      }
+      renderMenu({title:'Подключение Онлайн Мод',items:[{title:'Загружаю плагин...',
+        subtitle:'Источники появятся после завершения загрузки'}],
+        onBack:function () { clearTimeout(installTimer); self.showMenu(root); }});
+      var revision = generation;
+      var attempts = 0;
+      function check() {
+        if (!alive || revision !== generation || !isActive()) return;
+        if (installedChoices().length) { self.showMenu(root); return; }
+        if (++attempts >= 75) {
+          renderMenu({title:'Загрузка Онлайн Мод не завершена',items:[{title:'Перезапустить Lampa',_restart:true,
+            subtitle:'Плагин сохранён в расширениях; проверь соединение, если ошибка повторится'}],
+            onSelect:function (item) { if (item._restart) window.location.reload(); },
+            onBack:function () { self.showMenu(root); }});
+          return;
+        }
+        installTimer = setTimeout(check,200);
+      }
+      installTimer = setTimeout(check,200);
+    }
 
     function isActive() {
       try {
@@ -3234,8 +3608,15 @@ SOFTWARE.
     function setFocus() {
       if (!isActive() || !L.Controller.collectionSet ||
           !L.Controller.collectionFocus) return;
-      L.Controller.collectionSet(scroll.render());
-      L.Controller.collectionFocus(selected || false, scroll.render());
+      L.Controller.collectionSet(content);
+      L.Controller.collectionFocus(selected || false, content);
+    }
+
+    function ownsController() {
+      if (!started) return false;
+      if (typeof L.Controller.enabled !== 'function') return true;
+      var enabled = L.Controller.enabled();
+      return !!(enabled && enabled.name === 'content' && enabled.controller === controller);
     }
 
     function moveFallback(delta) {
@@ -3260,8 +3641,81 @@ SOFTWARE.
         Math.min(selectedIndex, Math.max(0, list.length - 1)));
       if (Math.floor(selectedIndex / MAX_ROWS) !== page) selectedIndex = page * MAX_ROWS;
       heading.text(menu.title || 'PluginLampa');
+      toolbar.empty();
+      var controlRows = [];
+      function control(label, action) {
+        var button = jq('<div class="selector pluginlampa-control"></div>');
+        button.text(label);
+        button.on('hover:enter', function () {
+          if (alive && token === generation && isActive()) action();
+        });
+        var focusControl = function () {
+          if (!alive || token !== generation || !isActive()) return;
+          if (selected) jq(selected).removeClass('pluginlampa-selected');
+          selected = button[0];
+          button.addClass('pluginlampa-selected');
+        };
+        button.on('hover:focus', focusControl);
+        controlRows.push({node:button[0],focus:focusControl});
+        toolbar.append(button);
+      }
+      if (menu._nativeShowSeasons) {
+        control('Сезон: ' + menu._nativeSeason, function () { menu._nativeShowSeasons(); });
+      }
+      if (rootMenu) {
+        var sourceLabel = chosenSource;
+        rootMenu.items.some(function (item) {
+          if (item && item._provider && item._provider.id === chosenSource) {
+            sourceLabel = item._provider.name; return true;
+          }
+          return false;
+        });
+        control('Источник: ' + (sourceLabel || 'выбрать'), function () {
+          settingsMenu = null;
+          renderMenu(sourceChooser(rootMenu));
+        });
+        function variantFilter(field, label, chosen, setChosen) {
+          if (!chosenSource) return;
+          var options = [];
+          rootMenu.items.forEach(function (entry) {
+            if (!entry || !entry._provider || entry._provider.id !== chosenSource) return;
+            var value = entry._watchVariant && entry._watchVariant[field] || '';
+            if (value && options.indexOf(value) === -1) options.push(value);
+          });
+          if (!options.length) return;
+          control(label + ': ' + (chosen || 'все'), function () {
+            var choices = [{title:'Все',_filterValue:''}].concat(options.map(function (v) {
+              return {title:v,_filterValue:v};
+            }));
+            renderMenu({
+              title:'Выбор · ' + label,items:choices,
+              onSelect:function (choice) {
+                if (!choice || !isActive()) return;
+                setChosen(choice._filterValue);
+                renderMenu(sourceMenu(rootMenu, chosenSource));
+              },
+              onBack:function () { renderMenu(sourceMenu(rootMenu, chosenSource)); }
+            });
+          });
+        }
+        variantFilter('translation','Перевод',chosenTranslation,function (v) { chosenTranslation=v; });
+        variantFilter('quality','Качество',chosenQuality,function (v) { chosenQuality=v; });
+        control('Обновить', function () {
+          settingsMenu = null;
+          var refresh = rootMenu.items.filter(function (item) { return item._action === 'refresh'; })[0];
+          if (refresh) rootMenu.onSelect(refresh);
+        });
+        var seriesAction = rootMenu.items.filter(function (item) { return item._actionHandler && item._actionHandler.id === 'stremio-series'; })[0];
+        if (seriesAction) control('Выбрать серию', function () { rootMenu.onSelect(seriesAction); });
+        control('Настройки и диагностика', function () {
+          settingsMenu = {title:'Настройки PluginLampa',items:rootMenu.items.filter(function (item) {
+            return item && !item._provider && !(item._actionHandler && item._actionHandler.id === 'stremio-series');
+          }),onSelect:rootMenu.onSelect,onBack:function () { settingsMenu = null; self.showMenu(rootMenu); }};
+          renderMenu(settingsMenu);
+        });
+      }
       rows.empty();
-      visibleRows = [];
+      visibleRows = controlRows;
       selected = null;
       var firstRow = null;
       var restoredRow = null;
@@ -3330,14 +3784,17 @@ SOFTWARE.
         empty.text('Список пуст');
         rows.append(empty);
       }
-      if (isActive()) {
-        self.start();
-      }
+      // Rendering a late result is not an Activity resume. In particular it
+      // must never switch away from a player, modal or another controller.
+      if (isActive() && ownsController()) setFocus();
     }
 
     function sourceMenu(root, id) {
       var rowsForSource = root.items.filter(function (item) {
-        return item && item._provider && item._provider.id === id;
+        if (!item || !item._provider || item._provider.id !== id) return false;
+        var variant = item._watchVariant || {};
+        return (!chosenQuality || variant.quality === chosenQuality) &&
+          (!chosenTranslation || variant.translation === chosenTranslation);
       });
       var first = rowsForSource[0];
       var label = first && first._provider ? first._provider.name : id;
@@ -3350,6 +3807,8 @@ SOFTWARE.
         },
         onBack: function () {
           chosenSource = null;
+          chosenQuality = '';
+          chosenTranslation = '';
           self.showMenu(root);
         }
       };
@@ -3377,25 +3836,46 @@ SOFTWARE.
           _nativeSource: id
         };
       });
+      if (!providers.length) choices.push({
+        title:'Нет подтверждённых потоков',
+        subtitle:'Cinemeta показывает серии, но не гарантирует видео. Проверь диагностику или другой источник',
+        _nativeEmpty:true
+      });
+            // Delegate through the installed plugin's public manifest entry point.
+      // Its own startup checks and Activity lifecycle must stay in control.
+      var online = installedChoices();
+      choices = choices.concat(online);
+      if (!online.length && L.Plugins && typeof L.Plugins.add === 'function' && typeof L.Plugins.get === 'function') {
+        choices.push({title:'Подключить Онлайн Мод',subtitle:'Сторонний плагин nb557 · источники, переводы и серии',_nativeInstallOnline:true});
+      }
       // Show explicit empty state instead of an unexplained command-only screen.
       if (!choices.length) choices.push({
-        title: 'Источники ничего не нашли',
+        title: 'Встроенные источники ничего не нашли',
         subtitle: 'Проверь диагностику или обнови поиск',
         _nativeEmpty: true
       });
-      choices = choices.concat(commands);
       return {
         title: root.title + ' · Источники',
         items: choices,
         onSelect: function (item) {
           if (!alive || !isActive()) return;
           if (item._nativeEmpty) return;
+          if (item._nativeInstalledPlugin) {
+            openInstalled(item._nativeInstalledPlugin);
+            return;
+          }
+          if (item._nativeInstallOnline) {
+            installOnline(root);
+            return;
+          }
           if (item._nativeSource) {
             chosenSource = item._nativeSource;
+            chosenQuality = '';
+            chosenTranslation = '';
             renderMenu(sourceMenu(root, chosenSource));
           } else root.onSelect(item);
         },
-        onBack: function () { L.Activity.backward(); }
+        onBack: function () { if (root.onBack) root.onBack(); else L.Activity.backward(); }
       };
     }
 
@@ -3407,32 +3887,94 @@ SOFTWARE.
     }
 
     this.isAlive = function () { return alive; };
+    this.selectEpisode = function (season, episode) {
+      if (!alive) return;
+      selectedEpisode = {season:season, episode:episode};
+      chosenSource = null;
+      chosenQuality = '';
+      chosenTranslation = '';
+    };
+    this.returnToViewing = function () {
+      if (!alive || !isActive()) return;
+      if (settingsMenu) renderMenu(settingsMenu);
+      else if (rootMenu) self.showMenu(rootMenu);
+      else L.Activity.backward();
+    };
     this.showMenu = function (next) {
       if (!alive) return;
       if (next && next._nativeGroupedResults) {
+        settingsMenu = null;
+        rootMenu = next;
         if (chosenSource && !next.items.some(function (item) {
           return item && item._provider && item._provider.id === chosenSource;
-        })) chosenSource = null;
+        })) { chosenSource = null; chosenQuality = ''; chosenTranslation = ''; }
+        if (!firstSeriesOpened && (movie.media_type === 'tv' || movie.first_air_date) &&
+            window.LampaVideoFinderStremio &&
+            typeof window.LampaVideoFinderStremio.openFirstSeason === 'function') {
+          firstSeriesOpened = true;
+          if (window.LampaVideoFinderStremio.openFirstSeason(movie)) return;
+        }
+        // A chosen episode opens its first verified direct-stream source immediately.
+        // The source selector above the list remains available for switching.
+        var episodeCard = selectedEpisode && selectedEpisode.season && selectedEpisode.episode;
+        if (episodeCard && !chosenSource) {
+          next.items.some(function (entry) {
+            if (!entry || !entry._watchVariant || !entry._provider) return false;
+            chosenSource = entry._provider.id;
+            return true;
+          });
+        }
         renderMenu(chosenSource ? sourceMenu(next, chosenSource) : sourceChooser(next));
       } else renderMenu(next);
     };
 
     this.create = function () {
       content.append(style);
-      content.append(heading);
-      content.append(rows);
-      scroll.append(content);
+      var posterPath = String(movie.poster_path || '');
+      if (/^\/[a-zA-Z0-9_.\/-]+$/.test(posterPath)) {
+        var poster = jq('<img class="pluginlampa-poster" alt="" />');
+        poster.attr('src', 'https://image.tmdb.org/t/p/w300' + posterPath);
+        sidebar.append(poster);
+      }
+      var filmTitle = jq('<div class="pluginlampa-film-title"></div>');
+      filmTitle.text(movie.title || movie.name || 'PluginLampa');
+      sidebar.append(filmTitle);
+      var info = jq('<div class="pluginlampa-film-info"></div>');
+      info.text([String(movie.release_date || movie.first_air_date || '').slice(0,4),
+        movie.vote_average ? '★ ' + movie.vote_average : '',
+        movie.runtime ? movie.runtime + ' мин' : ''].filter(Boolean).join(' · '));
+      sidebar.append(info);
+      var description = jq('<div class="pluginlampa-film-info pluginlampa-film-description"></div>');
+      description.text(String(movie.overview || '').slice(0,420));
+      sidebar.append(description);
+      main.append(toolbar);
+      main.append(heading);
+      scroll.append(rows);
+      main.append(scroll.render());
+      content.append(sidebar);
+      content.append(main);
       current = self;
       engine.attachNativePage(self);
-      self.showMenu({title:'PluginLampa · Поиск',items:[
+      self.showMenu({title:'PluginLampa · Поиск',items:installedChoices().concat([
         {title:'Ищем источники...',subtitle:'Результаты появятся на этой странице'}
-      ]});
+      ]),onSelect:function (item) { if (item._nativeInstalledPlugin) openInstalled(item._nativeInstalledPlugin); }});
       if (self.activity && typeof self.activity.loader === 'function') {
         self.activity.loader(true);
       }
       // The search may throw synchronously if an external plugin changes the
       // underlying Lampa APIs. The Activity must remain navigable/closeable.
-      try { engine.searchCard(movie); }
+      try {
+        // TV cards start at actual Cinemeta episodes, not an empty stream search.
+        var tv = movie.media_type === 'tv' || !!movie.first_air_date;
+        var catalog = window.LampaVideoFinderStremio;
+        if (tv && catalog && typeof catalog.openFirstSeason === 'function' &&
+            catalog.openFirstSeason(movie)) {
+          firstSeriesOpened = true;
+          self.showMenu({title:'PluginLampa · Серии',items:[
+            {title:'Получаю реальные серии из Cinemeta...',subtitle:'Потоки проверяются после выбора серии'}
+          ]});
+        } else engine.searchCard(movie);
+      }
       catch (err) {
         console.error('[PluginLampa] Native search startup failed', err);
         self.showMenu({title:'PluginLampa · Ошибка',items:[
@@ -3442,12 +3984,14 @@ SOFTWARE.
       return self.render();
     };
 
-    this.render = function () { return scroll.render(); };
+    this.render = function () { return content; };
 
     this.start = function () {
       if (!isActive()) return;
-      if (started) { setFocus(); return; }
-      L.Controller.add('content', {
+      // ActivitySlide.start replaces content before calling component.start,
+      // even when pause() was not called. add() replaces a named controller;
+      // it does not accumulate event listeners. Always reattach on resume.
+      controller = {
         toggle: function () { setFocus(); },
         left: function () {
           if (window.Navigator && typeof window.Navigator.canmove === 'function' &&
@@ -3467,7 +4011,8 @@ SOFTWARE.
           else moveFallback(1);
         },
         back: function () { self.back(); }
-      });
+      };
+      L.Controller.add('content', controller);
       L.Controller.toggle('content');
       started = true;
       if (self.activity && typeof self.activity.loader === 'function') {
@@ -3488,6 +4033,7 @@ SOFTWARE.
     this.destroy = function () {
       if (!alive) return;
       alive = false;
+      clearTimeout(installTimer);
       generation++;
       engine.detachNativePage(self);
       if (current === self) current = null;
@@ -3521,11 +4067,15 @@ SOFTWARE.
           return false;
         }
       },
-      active: function () { return !!(current && current.isAlive()); }
+      active: function () { return !!(current && current.isAlive()); },
+      selectEpisode: function (season, episode) {
+        if (current && current.isAlive()) current.selectEpisode(season, episode);
+      }
     };
   } catch (err) {
     console.warn('[PluginLampa] Native page unavailable', err);
   }
 })();
+
 
 })();
