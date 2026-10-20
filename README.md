@@ -1,3 +1,9 @@
+## Публикация TV · 21.10.2026
+
+`tv.js` обновлён до приватной сборки `develop-post-pilot` (bundle SHA `90ebbf41d4fe1ab1e7f4e81d015056f8c3d530c7`). Установка: `https://asarych.github.io/PluginLampa-public/tv.js`. Это **экспериментальная сборка**: воспроизведение Collaps S2E2 в Chrome подтверждено, но после Back и выбора аудио/качества активация серии после последних исправлений ещё не проверена live; переключение HLS дорожки и уровня не подтверждено; Samsung Tizen/MSX freeze остаётся открытым. `PluginLampa-beta.js` и `PluginLampa-anime-beta.js` не обновлялись. Ниже сохранены исторические заметки о предыдущих версиях (в частности старые утверждения о `tv.js` версии 0.6.1 уже не актуальны).
+
+---
+
 # Дополнительная бета 0.6.3 — AniLiberty (аниме)
 
 **Экспериментальная сборка:** `https://asarych.github.io/PluginLampa-public/PluginLampa-anime-beta.js`.
