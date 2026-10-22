@@ -4664,7 +4664,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
               return info?(info.watched?'✓ Просмотрено':('Продолжить '+Math.floor(info.position/60)+' мин')):base;
             })(),
             _nativeProgressRow:true};
-        }).concat(seasonEntries.length ? [] : rowsForSource),
+        }).concat(selectedEpisode ? rowsForSource.map(function(entry){
+          return {title:'Озвучка · '+String(entry._watchVariant&&entry._watchVariant.translation||
+              entry.title||'Оригинал'),
+            subtitle:'Выбрать перевод и качество',_nativeAtodoVariant:entry};
+        }) : rowsForSource),
         onSelect: function (item) {
           if (!alive || !isActive()) return;
           if (item && item._nativeEpisode && !seasonOpen) {activationDiagnostic('seasonOpen-missing','episode',generation);return;}
@@ -4672,6 +4676,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
             activationDiagnostic('episode-dispatch','episode',generation);
             autoplayEpisodeKey = String(item._nativeEpisode.season)+':'+String(item._nativeEpisode.episode);
             seasonOpen(item._nativeEpisode);
+            return;
+          }
+          if(item&&item._nativeAtodoVariant) {
+            autoplayResolvedStream=false;
+            root.onSelect(item._nativeAtodoVariant);
             return;
           }
           root.onSelect(item);
@@ -4862,6 +4871,8 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
           if(!candidate)candidate=candidates[0];
           autoplayEpisodeKey = '';
           if (candidate && typeof next.onSelect === 'function') {
+            // When Atodo exposes several translations, keep them selectable.
+            // The initial automatic playback still uses the preferred/first one.
             autoplayResolvedStream=true;
             next.onSelect(candidate);
           }
