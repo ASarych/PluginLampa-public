@@ -3512,6 +3512,9 @@ SOFTWARE.
                          /^\/[a-zA-Z0-9/_-]+\\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
                         entry.thumbnail='https://image.tmdb.org/t/p/w300'+loc.still_path;
                     });
+                    if(window.LampaVideoFinderNativePage &&
+                       typeof window.LampaVideoFinderNativePage.refreshEpisodeMetadata==='function')
+                      window.LampaVideoFinderNativePage.refreshEpisodeMetadata(Number(selected._season));
                     // Keep metadata for subsequent menu renders; never steal
                     // focus back from another page when network finishes.
                   },function(){});
@@ -4681,6 +4684,12 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       return value;
     };
     this.isAlive = function () { return alive; };
+    this.refreshEpisodeMetadata = function(season) {
+      if(!alive||Number(season)!==Number(currentSeason)||!menu||!isActive())return;
+      // Only repaint the current episode list, never reopen an earlier menu.
+      if(Array.isArray(menu.items)&&menu.items.some(function(x){return x&&x._nativeEpisode;}))
+        draw();
+    };
     this.setSeasonEpisodes = function (items, select, changeSeason, season) {
       if (!alive) return;
       seasonEntries = Array.isArray(items) ? items.slice(0, 100) : [];
