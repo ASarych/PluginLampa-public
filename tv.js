@@ -4363,10 +4363,27 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
           var previous=menu,api=window.PluginLampaProgress,p=api.settings();
           renderMenu({title:'Настройки просмотра',items:[
             {title:'Возобновление: '+(p.resume?'включено':'выключено'),_progressSetting:'resume'},
-            {title:'Просмотрено после: '+p.watchedPercent+'%',_progressSetting:'threshold'}
+            {title:'Просмотрено после: '+p.watchedPercent+'%',_progressSetting:'threshold'},
+            {title:'Качество по умолчанию',_progressSetting:'quality'},
+            {title:'Перевод по умолчанию: '+String(L.Storage.get('pluginlampa_preferred_translation_v1','')||'авто').slice(0,60),_progressSetting:'voice'}
           ],onSelect:function(item){
             if(!item||!item._progressSetting)return;
             var current=api.settings();
+            if(item._progressSetting==='quality'){
+              renderMenu({title:'Качество по умолчанию',items:
+                ['AUTO','360p','480p','720p','1080p'].map(function(q){
+                  return {title:q,_preferredQuality:q};
+                }),onSelect:function(q){
+                  if(!q)return;
+                  try{L.Storage.set('pluginlampa_preferred_quality_v1',q._preferredQuality);}catch(_){}
+                  renderMenu(previous);
+                },onBack:function(){renderMenu(previous);}});
+              return;
+            }
+            if(item._progressSetting==='voice'){
+              try{L.Storage.set('pluginlampa_preferred_translation_v1','');}catch(_){}
+              renderMenu(previous);return;
+            }
             if(item._progressSetting==='resume')current.resume=!current.resume;
             if(item._progressSetting==='threshold')current.watchedPercent=current.watchedPercent===90?95:90;
             api.setSettings(current);renderMenu(previous);
@@ -4442,7 +4459,10 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
             });
           });
         }
-        variantFilter('translation','Перевод',chosenTranslation,function (v) { chosenTranslation=v; });
+        variantFilter('translation','Перевод',chosenTranslation,function (v) {
+          chosenTranslation=v;
+          try{L.Storage.set('pluginlampa_preferred_translation_v1',v);}catch(_){}
+        });
         variantFilter('quality','Качество',chosenQuality,function (v) { chosenQuality=v; });
         control('Обновить', function () {
           settingsMenu = null;
@@ -4780,9 +4800,17 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         // Only explicitly chosen episode rows auto-play; initial page remains navigable.
         var selectedKey = selectedEpisode && String(selectedEpisode.season)+':'+String(selectedEpisode.episode);
         if (autoplayEpisodeKey && selectedKey === autoplayEpisodeKey && chosenSource) {
-          var candidate = next.items.filter(function (entry) {
-            return entry && entry._provider && entry._provider.id === chosenSource && entry._item;
-          })[0];
+          var candidates=next.items.filter(function(entry){
+            return entry&&entry._provider&&entry._provider.id===chosenSource&&entry._item;
+          });
+          var preferredTranslation='';
+          try{preferredTranslation=String(L.Storage.get('pluginlampa_preferred_translation_v1','')||'');}
+          catch(_){}
+          var candidate=preferredTranslation?candidates.filter(function(entry){
+            var t=entry._watchVariant&&entry._watchVariant.translation||'';
+            return t===preferredTranslation;
+          })[0]:null;
+          if(!candidate)candidate=candidates[0];
           autoplayEpisodeKey = '';
           if (candidate && typeof next.onSelect === 'function') {
             autoplayResolvedStream=true;
