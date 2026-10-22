@@ -1949,6 +1949,8 @@ SOFTWARE.
   // Opt-in diagnostic: never stringify playback objects, URL, currentSrc or errors.
   // It observes the real Lampa video element without replacing player internals.
   var atodoPictureReport = {text:'Ещё нет замера Atodo'};
+  // Native page is another IIFE: expose only a sanitized, URL-free diagnostic.
+  window.PluginLampaAtodoPicture = atodoPictureReport;
   function inspectAtodoPicture(provider,video) {
     var declared=String(video&&video.quality||'неизвестно').slice(0,24);
     var transport=String(video&&video.transport||'неизвестно').slice(0,24);
@@ -4448,7 +4450,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         if(L.Noty&&L.Noty.show)L.Noty.show('PluginLampa '+BUILD_ID);
       });
       control('Диагностика Atodo',function(){
-        if(L.Noty&&L.Noty.show)L.Noty.show(atodoPictureReport.text,{time:10000});
+        var report=window.PluginLampaAtodoPicture;
+        var message=report&&typeof report.text==='string'?
+          report.text:'Данные Atodo пока отсутствуют';
+        if(L.Noty&&typeof L.Noty.show==='function')
+          L.Noty.show(message,{time:10000});
       });
       control('Проверить обновление',function(){
         if(L.Noty&&L.Noty.show)L.Noty.show('Проверяю GitHub Pages...');
