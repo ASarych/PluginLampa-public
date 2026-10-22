@@ -1948,6 +1948,34 @@ SOFTWARE.
   }
   // Opt-in diagnostic: never stringify playback objects, URL, currentSrc or errors.
   // It observes the real Lampa video element without replacing player internals.
+  var atodoPictureReport = {text:'Ещё нет замера Atodo'};
+  function inspectAtodoPicture(provider,video) {
+    var declared=String(video&&video.quality||'неизвестно').slice(0,24);
+    var transport=String(video&&video.transport||'неизвестно').slice(0,24);
+    atodoPictureReport.text='Atodo '+provider.id+' · заявлено '+declared+' · '+transport+' · измерение...';
+    var started=Date.now();
+    function readPicture() {
+      try {
+        var el=L.PlayerVideo&&typeof L.PlayerVideo.video==='function'?L.PlayerVideo.video():null;
+        if(!el || !(Number(el.videoWidth)>0 && Number(el.videoHeight)>0)) {
+          if(Date.now()-started<15000)setTimeout(readPicture,2000);
+          else atodoPictureReport.text='Atodo · разрешение плеера недоступно; заявлено '+declared;
+          return;
+        }
+        var bitrate='битрейт недоступен';
+        try {
+          if(el.getVideoPlaybackQuality) {
+            var stat=el.getVideoPlaybackQuality();
+            if(stat&&Number.isFinite(stat.droppedVideoFrames))
+              bitrate='потеряно кадров '+stat.droppedVideoFrames+' (битрейт недоступен)';
+          }
+        }catch(_){}
+        atodoPictureReport.text='Atodo '+provider.id+' · '+el.videoWidth+'×'+el.videoHeight+
+          ' · заявлено '+declared+' · '+transport+' · '+bitrate;
+      }catch(_){atodoPictureReport.text='Atodo · замер не удался';}
+    }
+    setTimeout(readPicture,3000);
+  }
   var atodoDiagnosticGeneration = 0;
   function atodoPlaybackDiagnostic(provider, transport, playback, mediaUrl) {
     var enabled = false;
@@ -2178,6 +2206,7 @@ SOFTWARE.
       }
       if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
       L.Player.play(playback);
+      if(atodo)inspectAtodoPicture(provider,video);
       progressWatch(movie);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
@@ -3541,7 +3570,18 @@ SOFTWARE.
               metadataPresented=true;
               showEpisodes();
             }
-            var metadataFallback=setTimeout(presentSeason,5000);
+            // Keep the episode list hidden while the locale request is pending.
+            // A silent slow TMDB response must not flash English rows first.
+            if(window.LampaVideoFinderNativePage &&
+               typeof window.LampaVideoFinderNativePage.showMenu==='function') {
+              window.LampaVideoFinderNativePage.showMenu({
+                title:'Сезон '+selected._season+' · загрузка описаний',
+                items:[{title:'Загружаю названия и изображения серий…',
+                  subtitle:'Запрашиваю русские данные TMDB'}],
+                onBack:showSeasons
+              });
+            }
+            var metadataFallback=setTimeout(presentSeason,12000);
             // Use Lampa's configured TMDB source: no embedded API key or new proxy.
             // Only replace a title when the response really contains Cyrillic.
             var tmdb=L && L.Api && L.Api.sources && L.Api.sources.tmdb;
@@ -4406,6 +4446,9 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       }
       control('Версия: '+(window.PluginLampaBuild||'неизвестно'), function() {
         if(L.Noty&&L.Noty.show)L.Noty.show('PluginLampa '+BUILD_ID);
+      });
+      control('Диагностика Atodo',function(){
+        if(L.Noty&&L.Noty.show)L.Noty.show(atodoPictureReport.text,{time:10000});
       });
       control('Проверить обновление',function(){
         if(L.Noty&&L.Noty.show)L.Noty.show('Проверяю GitHub Pages...');
