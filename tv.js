@@ -1927,6 +1927,62 @@ SOFTWARE.
     });
     L.PlayerVideo.listener.follow('destroy', function () {pendingNativeTrackChoice = null;});
   }
+  // Opt-in diagnostic: never stringify playback objects, URL, currentSrc or errors.
+  // It observes the real Lampa video element without replacing player internals.
+  var atodoDiagnosticGeneration = 0;
+  function atodoPlaybackDiagnostic(provider, transport, playback, mediaUrl) {
+    var enabled = false;
+    try { enabled = L.Storage.get('video_finder_atodo_playback_diagnostics_v1', false) === true; }
+    catch (_) {}
+    if (!enabled) return;
+    var generation = ++atodoDiagnosticGeneration;
+    var scheme = /^https:\/\//i.test(mediaUrl) ? 'https' : /^http:\/\//i.test(mediaUrl) ? 'http' : 'other';
+    var pathname = mediaUrl.split(/[?#]/)[0];
+    var extension = /\.([a-z0-9]{2,5})$/i.exec(pathname);
+    var kind = extension ? extension[1].toLowerCase() : 'none';
+    function log(phase, details) {
+      try { console.info('[PluginLampa Atodo diag]', JSON.stringify({
+        phase:phase, source:provider.id, declaredTransport:transport,
+        scheme:scheme, extension:kind, hlsOption:playback.hls === true ? 'true' :
+          playback.hls === false ? 'false' : 'unset',
+        hlsType:typeof playback.hls_type === 'string' ? playback.hls_type : 'unset',
+        playerVideoAvailable:!!(L.PlayerVideo && typeof L.PlayerVideo.video === 'function'),
+        useplayerSetting:(function(){
+          try {
+            var v=L.Storage.get('useplayer', null);
+            return typeof v === 'string' ? v.slice(0,40) : typeof v;
+          } catch (_) {return 'unavailable';}
+        })(),
+        media:details
+      })); } catch (_) {}
+    }
+    log('play-call', null);
+    function probe(stage) {
+      if(generation !== atodoDiagnosticGeneration) return;
+      try {
+        var el=L.PlayerVideo && typeof L.PlayerVideo.video === 'function' ? L.PlayerVideo.video() : null;
+        if(!el && typeof document !== 'undefined') el=document.querySelector('video');
+        if(!el){log(stage,{videoPresent:false});return;}
+        function summary(){
+          return {videoPresent:true, tag:String(el.tagName||'').toLowerCase(),
+            readyState:Number(el.readyState)||0, networkState:Number(el.networkState)||0,
+            errorCode:el.error ? Number(el.error.code)||0 : 0,
+            paused:el.paused===true, width:Number(el.videoWidth)||0,height:Number(el.videoHeight)||0,
+            crossOrigin:el.crossOrigin == null ? 'unset' : String(el.crossOrigin).slice(0,24),
+            canPlayMp4:typeof el.canPlayType==='function' ? String(el.canPlayType('video/mp4')).slice(0,12):'unknown'};
+        }
+        log(stage,summary());
+        if(stage==='after-create'&&typeof el.addEventListener==='function'){
+          var onError=function(){if(generation===atodoDiagnosticGeneration)log('media-error',summary());};
+          el.addEventListener('error',onError);
+          setTimeout(function(){try{el.removeEventListener('error',onError);}catch(_){}},20000);
+        }
+      }catch(_){log(stage,{probeFailed:true});}
+    }
+    setTimeout(function(){probe('after-create');},500);
+    setTimeout(function(){probe('after-load');},3000);
+  }
+
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
     if (!stream) {
@@ -1939,14 +1995,30 @@ SOFTWARE.
         typeof activeNativePage.playbackPreferences === 'function'
           ? activeNativePage.playbackPreferences() : null;
       closeMenu();
-      L.Player.play({
+      var atodo = provider.id === 'atodo-jator' || provider.id === 'atodo-xinu';
+      var transport = atodo ? video.transport : null;
+      if (atodo && transport !== 'hls' && transport !== 'http') {
+        notify('Atodo вернул поток без подтверждённого формата', true);
+        return;
+      }
+      var playback = {
         url: stream,
         title: movie.title + ' — ' + (video.title || item.title || provider.name),
         movie: movie.card,
-        hls_type: provider.id === 'collaps-direct' && L.Platform &&
-          typeof L.Platform.is === 'function' && !L.Platform.is('tizen') &&
-          !L.Platform.is('orsay') ? 'hlsjs' : undefined
-      });
+        hls_type: (provider.id === 'collaps-direct' || transport === 'hls') &&
+          L.Platform && typeof L.Platform.is === 'function' &&
+          !L.Platform.is('tizen') && !L.Platform.is('orsay') ? 'hlsjs' : undefined
+      };
+      if (transport === 'http') {
+        // A progressive HTTP URL may have no extension. Do not inherit HLS
+        // auto-detection from the previously played HLS item.
+        playback.hls = false;
+        playback.hls_type = 'native';
+      } else if (transport === 'hls') {
+        playback.hls = true;
+      }
+      if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
+      L.Player.play(playback);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
           L.PlayerVideo && typeof L.PlayerVideo.video === 'function') {
@@ -2338,6 +2410,30 @@ SOFTWARE.
             translation:String(item.translation||''),quality:String(item.quality||''),
             original:!item.translation,providerItem:item};
         }
+        if (provider.id === 'atodo-jator' || provider.id === 'atodo-xinu') {
+          var alias = provider.id.slice('atodo-'.length);
+          var type = movie.media_type === 'tv' ? 'tv' : 'movie';
+          var tmdb = String(movie.tmdb_id || '');
+          if (!/^\d+$/.test(tmdb) || item.atodoAlias !== alias ||
+              item.atodoTmdb !== tmdb || item.atodoType !== type ||
+              item.verifiedMediaId !== 'tmdb:' + tmdb ||
+              item.verifiedMediaType !== type ||
+              !item.atodoTranslationId || item.id !== alias + ':' +
+                item.atodoTranslationId + ':' +
+                (type === 'tv' ? item.atodoSeason + ':' + item.atodoEpisode : 'movie'))
+            return null;
+          if (type === 'tv') {
+            var c = movie.card || {};
+            var season = Number(c.season_number || c.season);
+            var episode = Number(c.episode_number || c.episode);
+            if (!Number.isInteger(season) || !Number.isInteger(episode) ||
+                season < 1 || episode < 1 ||
+                item.atodoSeason !== season || item.atodoEpisode !== episode) return null;
+          }
+          return {sourceId:provider.id, mediaId:'tmdb:' + tmdb,
+            title:movie.title, translation:String(item.translation||''),
+            quality:'', original:!item.translation, providerItem:item};
+        }
         if (provider.id.indexOf('stremio:') !== 0) return null;
         var key = String(item.videoId || '');
         var imdb = String(movie.imdb_id || '');
@@ -2442,8 +2538,8 @@ SOFTWARE.
           ? results.concat(menuActions, utilityEntries)
           : pageResults.concat(paging, menuActions.filter(function (action) {
               return results.length <= RESULTS_PAGE_SIZE ||
-                !action._actionHandler || action._actionHandler.id !== 'rezka-cors-diagnostic' &&
-                action._actionHandler.id !== 'videocdn-cors-diagnostic';
+                !action._actionHandler || action._actionHandler.id !== 'videocdn-cors-diagnostic' &&
+                action._actionHandler.id !== 'atodo-toggle';
             }), utilityEntries);
         displayMenu({
         _nativeGroupedResults: nativeResults,
@@ -3524,35 +3620,168 @@ E.registerAction({id:'collaps-toggle',title:'Collaps · эксперимента
  open:function(){try{L.Storage.set(KEY,!enabled());L.Noty.show('Collaps '+(enabled()?'включён':'выключен'));}catch(_){}}});
 window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:masterMeta};
 })();
-/* Rezka compatibility diagnostic: only a public GET, never streams or cookies. */
+/* Experimental Atodo source adapter. Explicit opt-in; no signed URL persistence. */
 (function(){
- 'use strict';
- var L=window.Lampa,E=window.LampaVideoFinder;
- if(!L||!E||typeof E.registerAction!=='function')return;
- var KEY='video_finder_rezka_diagnostic_v1';
- function report(status){
-  try{L.Noty.show('Rezka · '+status);}catch(_){}
- }
- function check(){
-  if(typeof fetch!=='function'){report('fetch недоступен в этой версии WebView');return;}
-  var done=false,started=Date.now(),controller=typeof AbortController==='function'?new AbortController():null;
-  var timer=setTimeout(function(){if(done)return;done=true;if(controller)controller.abort();report('таймаут GET');},7000);
-  function finish(message){
-   if(done)return;done=true;clearTimeout(timer);
-   report(message);
-  }
-  // Same fetch semantics as isolated probe, deliberately no Referer spoofing.
-  fetch('https://rezka.ag/',{method:'GET',mode:'cors',credentials:'omit',cache:'no-store',
-   signal:controller?controller.signal:undefined}).then(function(response){
-    finish('GET HTTP '+Number(response.status||0)+' · CORS '+(response.type==='opaque'?'не читается':'читается')+' · '+(Date.now()-started)+'мс');
-  },function(err){
-    finish('GET недоступен · '+String(err&&err.name||'Error').slice(0,36));
+'use strict';
+var E=window.LampaVideoFinder,L=window.Lampa;
+if(!E||!L||!E.registerProvider)return;
+var BASE='http://api.atodo.fun/api/source/';
+var ALIASES=['jator','xinu']; // krud contract unverified
+var KEY='video_finder_atodo_enabled_v1';
+// Opt-in: sends the TMDB id to a third-party HTTP service, so it is off until the user enables it.
+function switchedOn(){
+  try{var v=L.Storage.get(KEY,false);return v===true||v==='true'||v===1;}
+  catch(_){return false;}
+}
+function enabled(){
+  try{return switchedOn() && window.location.protocol==='http:';}
+  catch(_){return false;}
+}
+function episode(m){
+  var c=m.card||{},s=Number(c.season_number||c.season),e=Number(c.episode_number||c.episode);
+  return Number.isInteger(s)&&s>0&&Number.isInteger(e)&&e>0?[s,e]:null;
+}
+function supported(m){
+  return enabled() && /^\d+$/.test(String(m.tmdb_id||'')) &&
+    (m.media_type!=='tv'||!!episode(m));
+}
+function request(url){
+  // Never surface request URLs: ?data= contains opaque access credentials.
+  var req;
+  try {
+    req=typeof fetch==='function' ?
+      fetch(url,{method:'GET',credentials:'omit',redirect:'error'}).then(function(r){
+        if(!r.ok)throw Error('HTTP '+r.status);
+        return r.json();
+      }) : E.requestJson(url);
+  } catch(_){return Promise.reject(Error('Atodo network request failed'));}
+  return Promise.resolve(req).catch(function(){
+    throw Error('Atodo network request failed');
   });
- }
- E.registerAction({id:'rezka-cors-diagnostic',title:'Rezka · диагностика CORS (без видео)',
-  subtitle:'Только GET главной страницы, без cookies, proxy и потоков',
-  open:check});
- window.PluginLampaRezkaDiagnostic={run:check};
+}
+function query(m){
+  return 'id='+encodeURIComponent(String(m.tmdb_id))+'&type='+
+    (m.media_type==='tv'?'tv':'movie');
+}
+function array(v){return Array.isArray(v)?v:[];}
+function children(obj,key){
+  if(!obj)return [];
+  var v=obj[key];
+  if(Array.isArray(v))return v;
+  if(v&&typeof v==='object')return Object.keys(v).map(function(k){return v[k];});
+  return [];
+}
+function identity(v){return String(v&&(v.translation_id!=null?v.translation_id:v.id!=null?v.id:''));}
+function matchingEpisode(t,ep){
+  var seasons=children(t,'seasons');
+  var season=seasons.filter(function(s){return Number(s.season_number||s.season||s.number||s.season_id)===ep[0];})[0];
+  if(!season)return null;
+  return children(season,'episodes').filter(function(e){return Number(e.episode_number||e.episode||e.number||e.episode_id)===ep[1];})[0]||null;
+}
+function candidates(alias,m,response){
+  var root=response&&response.data&&response.data.translations?response.data:response;
+  var translations=children(root,'translations');
+  var ep=m.media_type==='tv'?episode(m):null;
+  return translations.slice(0,80).map(function(t){
+    var selected=ep?matchingEpisode(t,ep):t;
+    if(!selected||!selected.data)return null;
+    var tid=identity(t);
+    if(!tid)return null;
+    var name=String(t.translation_name||t.name||'Озвучка').slice(0,120);
+    return {id:alias+':'+tid+':'+(ep?ep.join(':'):'movie'),
+      title:name,translation:name,quality:'',subtitle:'Atodo · '+alias,
+      atodoAlias:alias,atodoTranslationId:tid,
+      atodoSeason:ep?ep[0]:0,atodoEpisode:ep?ep[1]:0,
+      atodoTmdb:String(m.tmdb_id),atodoType:m.media_type==='tv'?'tv':'movie',
+      verifiedMediaId:'tmdb:'+String(m.tmdb_id),verifiedMediaType:m.media_type==='tv'?'tv':'movie'};
+  }).filter(Boolean);
+}
+function locate(item,response){
+  var root=response&&response.data&&response.data.translations?response.data:response;
+  var t=children(root,'translations').filter(function(x){return identity(x)===item.atodoTranslationId;})[0];
+  if(!t)return null;
+  if(item.atodoType==='tv'){
+    var e=matchingEpisode(t,[item.atodoSeason,item.atodoEpisode]);
+    return e&&e.data||null;
+  }
+  return t.data||null;
+}
+function encodeData(data){
+  // Serialize only for in-flight request. Never include in candidates/cache.
+  var json=JSON.stringify(data);
+  var bytes=encodeURIComponent(json).replace(/%([0-9A-F]{2})/g,function(_,hex){return String.fromCharCode(parseInt(hex,16));});
+  return btoa(bytes);
+}
+function safeUrl(raw){
+  if(typeof raw!=='string'||!raw||raw.length>8192||
+      /[\s\\<>\u0000-\u001f\u007f]/.test(raw))return '';
+  var match=raw.match(/^(https?):\/\/([^\/?#]+)(?:[\/?#]|$)/i);
+  if(!match||match[2].indexOf('@')!==-1||match[2].indexOf('%')!==-1)return '';
+  var authority=match[2],host='',port='';
+  if(authority.charAt(0)==='['){
+    // Reject all IP literals, including IPv6 loopback, private and link-local.
+    return '';
+  }
+  var parts=authority.match(/^([a-z0-9.-]+)(?::([0-9]{1,5}))?$/i);
+  if(!parts)return '';
+  host=parts[1].toLowerCase();port=parts[2]||'';
+  if(port&&(+port<1||+port>65535))return '';
+  if(host==='localhost'||/\\.localhost$/.test(host)||host==='0.0.0.0'||
+     host==='255.255.255.255'||host.indexOf('..')>=0)return '';
+  // IP literals can express loopback/private ranges in decimal, octal, etc.
+  // Fail closed for numeric-looking hostnames, not just dotted-decimal ones.
+  if(/^[0-9.]+$/.test(host)||/^0x[0-9a-f.]+$/i.test(host))return '';
+  if(!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(host)||host.indexOf('.')<0)return '';
+  return raw;
+}
+function streams(alias,data){
+  var root=data&&data.data&&data.data.streams?data.data:data;
+  var v=root&&root.streams&&root.streams.video;
+  if(!v)return [];
+  var out=[],hls=v.hls&&safeUrl(v.hls.master);
+  if(hls)out.push({title:'HLS · Авто',subtitle:'Atodo '+alias,url:hls,quality:'AUTO',transport:'hls'});
+  var qs=v.http&&v.http.qualities;
+  if(qs&&typeof qs==='object'&&!Array.isArray(qs))
+    Object.keys(qs).filter(function(q){return /^[1-9]\d{1,3}$/.test(q)&&Number(q)<=4320;})
+      .sort(function(a,b){return Number(a)-Number(b);})
+      .forEach(function(q){var u=safeUrl(qs[q]);if(u)out.push({title:q+'p',subtitle:'Atodo '+alias,url:u,quality:q+'p',transport:'http'});});
+  return out;
+}
+function provider(alias){
+  return {id:'atodo-'+alias,name:'Atodo · №'+(alias==='jator'?'1':'2'),siteUrl:'http://atodo.fun/',
+    timeoutMs:15000,persistStreams:false,
+    supports:supported,
+    unavailableReason:function(m){return !switchedOn()?'Выключен. Включи пунктом ⚙ Atodo в меню результатов.':!enabled()?'Atodo работает только на HTTP-origin':
+      m.media_type==='tv'&&!episode(m)?'Откройте конкретную серию':'Требуется TMDB ID';},
+    search:function(m){
+      if(!supported(m))return Promise.resolve([]);
+      return request(BASE+alias+'?'+query(m)).then(function(data){
+        if(data&&data.success===false)throw Error('Atodo search failed');
+        return candidates(alias,m,data);
+      });
+    },
+    resolve:function(item){
+      if(!enabled()||!item||item.atodoAlias!==alias||
+        !/^\d+$/.test(String(item.atodoTmdb||''))||
+        (item.atodoType!=='movie'&&item.atodoType!=='tv'))return Promise.resolve([]);
+      var info={tmdb_id:item.atodoTmdb,media_type:item.atodoType,
+        card:{season_number:item.atodoSeason,episode_number:item.atodoEpisode}};
+      return request(BASE+alias+'?'+query(info)).then(function(result){
+        var data=locate(item,result);
+        if(!data)throw Error('Atodo selection no longer available');
+        return request(BASE+alias+'?data='+encodeURIComponent(encodeData(data)));
+      }).then(function(result){return streams(alias,result);});
+    }
+  };
+}
+ALIASES.forEach(function(alias){E.registerProvider(provider(alias));});
+if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · плеер-агрегатор (эксперимент)',
+  subtitle:'Включить/выключить; отправляет TMDB ID на api.atodo.fun по HTTP',
+  open:function(){
+    var on=!switchedOn();
+    try{L.Storage.set(KEY,on);}catch(_){}
+    try{L.Noty.show('Atodo '+(on?'включён':'выключен')+(on&&window.location.protocol!=='http:'?', но нужен HTTP-origin':'')+'. Нажми ↻ Обновить поиск.');}catch(_){}
+  }});
 })();
 
 /* VideoCDN connection probe, opt-in via action. No API token, video, or proxy. */
@@ -3773,6 +4002,7 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
     var selectedIndex = 0;
     var menu = null;
     var chosenSource = null;
+    var sourceExplicit = false;
     var chosenQuality = '';
     var chosenTranslation = '';
     var rootMenu = null;
@@ -3811,42 +4041,6 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
         console.warn('[PluginLampa] Installed online plugin failed', err);
         if (L.Noty && L.Noty.show) L.Noty.show('Не удалось открыть установленный Онлайн Мод');
       }
-    }
-
-    function installOnline(root) {
-      var url = 'https://nb557.github.io/plugins/online_mod.js';
-      var existing = L.Plugins.get().filter(function (plugin) { return plugin.url === url; })[0];
-      if (existing) {
-        renderMenu({title:'Онлайн Мод уже добавлен',items:[{title:'Перезапустить Lampa',
-          subtitle:'Для завершения загрузки установленного плагина',_restart:true}],
-          onSelect:function (item) { if (item._restart) window.location.reload(); },
-          onBack:function () { self.showMenu(root); }});
-        return;
-      }
-      try { L.Plugins.add({url:url,status:1,name:'Онлайн Мод',author:'@nb557'}); }
-      catch (err) {
-        renderMenu({title:'Не удалось подключить Онлайн Мод',items:[{title:'Попробуй ещё раз через настройки расширений Lampa'}],
-          onBack:function () { self.showMenu(root); }});
-        return;
-      }
-      renderMenu({title:'Подключение Онлайн Мод',items:[{title:'Загружаю плагин...',
-        subtitle:'Источники появятся после завершения загрузки'}],
-        onBack:function () { clearTimeout(installTimer); self.showMenu(root); }});
-      var revision = generation;
-      var attempts = 0;
-      function check() {
-        if (!alive || revision !== generation || !isActive()) return;
-        if (installedChoices().length) { self.showMenu(root); return; }
-        if (++attempts >= 75) {
-          renderMenu({title:'Загрузка Онлайн Мод не завершена',items:[{title:'Перезапустить Lampa',_restart:true,
-            subtitle:'Плагин сохранён в расширениях; проверь соединение, если ошибка повторится'}],
-            onSelect:function (item) { if (item._restart) window.location.reload(); },
-            onBack:function () { self.showMenu(root); }});
-          return;
-        }
-        installTimer = setTimeout(check,200);
-      }
-      installTimer = setTimeout(check,200);
     }
 
     function isActive() {
@@ -3947,6 +4141,23 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
         control('Сезон: ' + (currentSeason || seasonEntries[0].season), function () { seasonChooser(); });
       } else if (menu._nativeShowSeasons) {
         control('Сезон: ' + menu._nativeSeason, function () { menu._nativeShowSeasons(); });
+      }
+      if (!rootMenu && seasonEntries.length && engine.listProviderHealth) {
+        control('Источник: ' + (chosenSource || 'авто'), function () {
+          var previous = menu;
+          var known = engine.listProviderHealth().filter(function (p) {
+            return p && typeof p.id === 'string' && p.id && p.discovery !== true;
+          });
+          var options = [{title:'Автоматически',_initialSource:''}].concat(known.map(function (p) {
+            return {title:p.name || p.id,subtitle:p.available ? 'Источник' : 'Может быть недоступен',_initialSource:p.id};
+          }));
+          renderMenu({title:'Выбрать источник',items:options,onSelect:function (choice) {
+            if (!choice || typeof choice._initialSource !== 'string') return;
+            chosenSource = choice._initialSource || null;
+            sourceExplicit = !!chosenSource;
+            renderMenu(previous);
+          },onBack:function () { renderMenu(previous); }});
+        });
       }
       if (rootMenu) {
         var sourceLabel = chosenSource;
@@ -4177,9 +4388,6 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
       // Its own startup checks and Activity lifecycle must stay in control.
       var online = installedChoices();
       choices = choices.concat(online);
-      if (!online.length && L.Plugins && typeof L.Plugins.add === 'function' && typeof L.Plugins.get === 'function') {
-        choices.push({title:'Подключить Онлайн Мод',subtitle:'Сторонний плагин nb557 · источники, переводы и серии',_nativeInstallOnline:true});
-      }
       // Show explicit empty state instead of an unexplained command-only screen.
       if (!choices.length) choices.push({
         title: 'Встроенные источники ничего не нашли',
@@ -4196,12 +4404,9 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
             openInstalled(item._nativeInstalledPlugin);
             return;
           }
-          if (item._nativeInstallOnline) {
-            installOnline(root);
-            return;
-          }
           if (item._nativeSource) {
             chosenSource = item._nativeSource;
+            sourceExplicit = true;
             chosenQuality = '';
             chosenTranslation = '';
             renderMenu(sourceMenu(root, chosenSource));
@@ -4234,6 +4439,11 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
     };
     this.selectEpisode = function (season, episode) {
       if (!alive) return;
+      // Prior non-episode search filters must not leak into the first episode.
+      if (!selectedEpisode && rootMenu && chosenSource && !sourceExplicit) {
+        chosenSource = null; sourceExplicit = false;
+        chosenQuality = ''; chosenTranslation = '';
+      }
       selectedEpisode = {season:season, episode:episode};
       // Keep chosen source and translation when moving between episodes.
     };
@@ -4255,7 +4465,9 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
         rootMenu = next;
         if (chosenSource && !next.items.some(function (item) {
           return item && item._provider && item._provider.id === chosenSource;
-        })) { chosenSource = null; chosenQuality = ''; chosenTranslation = ''; }
+        })) {
+          if (!sourceExplicit || !selectedEpisode) { chosenSource = null; sourceExplicit = false; chosenQuality = ''; chosenTranslation = ''; }
+        }
         if (!firstSeriesOpened && (movie.media_type === 'tv' || movie.first_air_date) &&
             window.LampaVideoFinderStremio &&
             typeof window.LampaVideoFinderStremio.openFirstSeason === 'function') {
@@ -4265,7 +4477,7 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
         // A chosen episode opens its first verified direct-stream source immediately.
         // The source selector above the list remains available for switching.
         var episodeCard = selectedEpisode && selectedEpisode.season && selectedEpisode.episode;
-        if (episodeCard && !chosenSource) {
+        if (episodeCard && !chosenSource && !sourceExplicit) {
           next.items.some(function (entry) {
             if (!entry || !entry._watchVariant || !entry._provider) return false;
             chosenSource = entry._provider.id;
@@ -4281,6 +4493,7 @@ window.PluginLampaCollapsParser={parse:parse,diagnostic:diagnostic,masterMeta:ma
           })[0];
           autoplayEpisodeKey = '';
           if (candidate && typeof next.onSelect === 'function') next.onSelect(candidate);
+          else if (sourceExplicit && L.Noty && L.Noty.show) L.Noty.show('Выбранный источник не нашёл поток для этой серии');
         }
       } else renderMenu(next);
     };
