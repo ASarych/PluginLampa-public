@@ -4077,6 +4077,8 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       return !!(enabled && enabled.name === 'content' && enabled.controller === controller);
     }
 
+    var focusScrollUpdating = false;
+
     function moveFallback(delta) {
       if (!isActive() || !visibleRows.length) return;
       var index = 0;
@@ -4299,7 +4301,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
             selectedIndex = page * MAX_ROWS + localIndex;
             focusMemory[menu.title || 'PluginLampa'] = selectedIndex;
           }
-          if (typeof scroll.update === 'function') scroll.update(row, true);
+          if (typeof scroll.update === 'function' && !focusScrollUpdating) {
+            focusScrollUpdating = true;
+            try { scroll.update(row, true); }
+            finally { focusScrollUpdating = false; }
+          }
         };
         row.on('hover:focus', focusRow);
         visibleRows.push({node: row[0], focus: focusRow, activate: activateRowOnce,kind:item&&item._nativeEpisode?'episode':'source'});
