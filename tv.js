@@ -2041,9 +2041,9 @@ SOFTWARE.
     if(activeProgressCleanup){activeProgressCleanup();activeProgressCleanup=null;}
     if(!id)return;
     var previous=progressItem(movie),started=Date.now(),active=true,attached=null,
-        lastWrite=0,cleanListeners=function(){};
+        lastWrite=0,mediaInitialized=false,cleanListeners=function(){};
     function save(force){
-      if(!active||!attached)return;
+      if(!active||!attached||!mediaInitialized)return;
       var t=Number(attached.currentTime),d=Number(attached.duration);
       if(!Number.isFinite(d)||d<30||!Number.isFinite(t))return;
       var prior=progressItem(movie);
@@ -2072,6 +2072,7 @@ SOFTWARE.
       function ready(){
         if(resumed||!active||el!==attached)return;
         resumed=true;
+        mediaInitialized=true;
         if(!progressPreferences().resume||!previous||previous.watched||
            previous.position<20)return;
         var duration=Number(el.duration);
@@ -2084,12 +2085,14 @@ SOFTWARE.
       function pause(){save(true);}
       function ended(){save(true);}
       el.addEventListener('loadedmetadata',ready);
+      el.addEventListener('playing',ready);
       el.addEventListener('timeupdate',tick);
       el.addEventListener('pause',pause);
       el.addEventListener('ended',ended);
       cleanListeners=function(){
         try{
           el.removeEventListener('loadedmetadata',ready);
+          el.removeEventListener('playing',ready);
           el.removeEventListener('timeupdate',tick);
           el.removeEventListener('pause',pause);
           el.removeEventListener('ended',ended);
