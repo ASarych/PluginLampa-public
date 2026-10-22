@@ -1983,6 +1983,74 @@ SOFTWARE.
     setTimeout(function(){probe('after-load');},3000);
   }
 
+  // Local playback progress; signed source URLs are never persisted.
+  var PROGRESS_KEY='pluginlampa_progress_v1';
+  function progressId(movie) {
+    var id=String(movie&&movie.tmdb_id||'');
+    if(!/^\\d+$/.test(id))return '';
+    var card=movie.card||{};
+    var kind=movie.media_type==='tv'?'tv':'movie';
+    if(kind==='movie')return kind+':'+id;
+    var sn=Number(card.season_number||card.season),ep=Number(card.episode_number||card.episode);
+    return Number.isInteger(sn)&&sn>0&&Number.isInteger(ep)&&ep>0?'tv:'+id+':'+sn+':'+ep:'';
+  }
+  function progressRead() {
+    try {
+      var value=L.Storage.get(PROGRESS_KEY,{});
+      if(typeof value==='string')value=JSON.parse(value);
+      return value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+    }catch(_){return {};}
+  }
+  function progressItem(movie) {var id=progressId(movie);return id?progressRead()[id]||null:null;}
+  function progressWrite(id,position,duration,completed) {
+    if(!id||!Number.isFinite(position)||!Number.isFinite(duration)||
+       duration<30||position<0)return;
+    var data=progressRead(),keys=Object.keys(data);
+    if(keys.length>=300){
+      keys.sort(function(a,b){return Number(data[a]&&data[a].updated||0)-Number(data[b]&&data[b].updated||0);});
+      keys.slice(0,keys.length-299).forEach(function(k){delete data[k];});
+    }
+    data[id]={position:Math.floor(position),duration:Math.floor(duration),
+      watched:!!completed,updated:Date.now()};
+    try{L.Storage.set(PROGRESS_KEY,data);}catch(_){}
+  }
+  function progressWatch(movie) {
+    var id=progressId(movie);
+    if(!id||!L.PlayerVideo||typeof L.PlayerVideo.video!=='function')return;
+    var previous=progressItem(movie),started=Date.now(),attached=null,lastWrite=0,finished=false;
+    function inspect(){
+      if(finished||Date.now()-started>120000){clearInterval(timer);return;}
+      var el;
+      try{el=L.PlayerVideo.video();}catch(_){return;}
+      if(!el||el===attached||typeof el.addEventListener!=='function')return;
+      attached=el;
+      function save(force){
+        if(!attached||el!==attached)return;
+        var t=Number(el.currentTime),d=Number(el.duration);
+        if(!Number.isFinite(d)||d<30||!Number.isFinite(t))return;
+        var end=el.ended||t/d>=0.92;
+        if(force||end||Date.now()-lastWrite>10000){
+          lastWrite=Date.now();progressWrite(id,t,d,end);
+        }
+      }
+      function onReady(){
+        if(!previous||previous.watched||previous.position<20)return;
+        var d=Number(el.duration);
+        if(!Number.isFinite(d)||d<30||previous.position>=d-20)return;
+        try{el.currentTime=previous.position;}catch(_){}
+        previous=null;
+      }
+      el.addEventListener('loadedmetadata',onReady,{once:true});
+      el.addEventListener('timeupdate',function(){save(false);});
+      el.addEventListener('pause',function(){save(true);});
+      el.addEventListener('ended',function(){save(true);finished=true;clearInterval(timer);});
+      if(el.readyState>=1)onReady();
+      clearInterval(timer);
+    }
+    var timer=setInterval(inspect,400);
+    inspect();
+  }
+  window.PluginLampaProgress={get:progressItem,progressId:progressId};
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
     if (!stream) {
@@ -2019,6 +2087,7 @@ SOFTWARE.
       }
       if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
       L.Player.play(playback);
+      progressWatch(movie);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
           L.PlayerVideo && typeof L.PlayerVideo.video === 'function') {
@@ -3290,7 +3359,7 @@ SOFTWARE.
         var key = String(season);
         if (!seasons[key]) seasons[key] = [];
         if (seasons[key].some(function (v) { return v.episode === episode; })) return;
-        seasons[key].push({season: season, episode: episode, title: short(entry.title || entry.name || '')});
+        seasons[key].push({season: season, episode: episode, title: short(entry.title || entry.name || ''), thumbnail: typeof entry.thumbnail==='string' && /^https:\/\//.test(entry.thumbnail)?entry.thumbnail:''});
         count++;
       });
       if (!count) throw Error('В Cinemeta нет подходящих эпизодов');
@@ -3313,7 +3382,7 @@ SOFTWARE.
               _nativeSeason: selected._season,
               _nativeShowSeasons: showSeasons,
               items: episodes.map(function (ep) {
-                return {title: 'Серия ' + ep.episode + (ep.title ? ' · ' + ep.title : ''), _episode: ep};
+                return {title: 'Серия ' + ep.episode + (ep.title ? ' · ' + ep.title : ''), subtitle:(function(){var p=window.PluginLampaProgress&&window.PluginLampaProgress.get({tmdb_id:movie.tmdb_id,media_type:'tv',card:{season_number:ep.season,episode_number:ep.episode}});return p?(p.watched?'✓ Просмотрено':'Продолжить с '+Math.floor(p.position/60)+' мин'):'';})(),_episode: ep};
               }),
               onSelect: function (selectedEp) {
                 if (!selectedEp || menuGeneration !== episodeMenuGeneration) return;
