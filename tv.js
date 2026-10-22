@@ -2719,6 +2719,11 @@ SOFTWARE.
     listProviders: function () { return providers.map(function (p) { return p.id; }); },
     listKnownSources: sourceList,
     listProviderHealth: providerStatuses,
+    getEpisodeAvailability: function(providerId,card) {
+      var p=providers.filter(function(x){return x.id===providerId;})[0];
+      if(!p||typeof p.availableEpisodes!=='function')return Promise.resolve(null);
+      return Promise.resolve().then(function(){return p.availableEpisodes(movieInfo(card));}).catch(function(){return null;});
+    },
     knowledgeStatus: knowledgeStatus,
     knownRoutes:function(card){var kb=knowledgeBase();return kb?kb.routes.routesFor(movieKey(movieInfo(card))):[];},
     clearMovieCache: function (card) { forgetMovie(movieInfo(card)); },
@@ -3860,6 +3865,29 @@ function provider(alias){
     supports:supported,
     unavailableReason:function(m){return !switchedOn()?'Выключен. Включи пунктом ⚙ Atodo в меню результатов.':!enabled()?'Atodo работает только на HTTP-origin':
       m.media_type==='tv'&&!episode(m)?'Откройте конкретную серию':'Требуется TMDB ID';},
+    availableEpisodes:function(m){
+      // Exact catalogue availability, not a batch of stream resolves.
+      if(!enabled()||m.media_type!=='tv'||!/^\\d+$/.test(String(m.tmdb_id||'')))
+        return Promise.resolve(null);
+      return request(BASE+alias+'?id='+encodeURIComponent(String(m.tmdb_id))+'&type=tv')
+        .then(function(response){
+          var root=response&&response.data&&response.data.translations?response.data:response;
+          if(!root||String(root.tmdb_id||'')!==String(m.tmdb_id))return null;
+          var present={},count=0;
+          children(root,'translations').forEach(function(t){
+            children(t,'seasons').forEach(function(season){
+              var sn=Number(season.season_number||season.season||season.number||season.season_id);
+              if(!Number.isInteger(sn)||sn<1)return;
+              children(season,'episodes').forEach(function(ep){
+                var en=Number(ep.episode_number||ep.episode||ep.number||ep.episode_id);
+                if(!Number.isInteger(en)||en<1||!ep.data)return;
+                present[sn+':'+en]=true;count++;
+              });
+            });
+          });
+          return count?{verified:true,episodes:Object.keys(present)}:null;
+        }).catch(function(){return null;});
+    },
     search:function(m){
       if(!supported(m))return Promise.resolve([]);
       return request(BASE+alias+'?'+query(m)).then(function(data){
@@ -4119,6 +4147,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
     var selectedEpisode = null;
     var autoplayEpisodeKey = '';
     var seasonEntries = [];
+    var availabilityBySource=Object.create(null);
     var seasonOpen = null;
     var seasonChooser = null;
     var currentSeason = null;
@@ -4456,7 +4485,23 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       if (isActive() && ownsController()) setFocus();
     }
 
+    function ensureAvailability(root,id) {
+      if(!seasonEntries.length||!/^atodo-(?:jator|xinu)$/.test(id)||
+         !engine.getEpisodeAvailability||
+         Object.prototype.hasOwnProperty.call(availabilityBySource,id))return;
+      availabilityBySource[id]={pending:true};
+      engine.getEpisodeAvailability(id,movie).then(function(result){
+        if(!alive)return;
+        availabilityBySource[id]=result&&result.verified?result:{verified:false};
+        if(chosenSource===id&&menu&&menu.title==='PluginLampa · '+(
+            root.items.filter(function(x){return x&&x._provider&&x._provider.id===id;})[0]||{}
+          )._provider?.name)renderMenu(sourceMenu(root,id));
+      });
+    }
     function sourceMenu(root, id) {
+      ensureAvailability(root,id);
+      var confirmed=availabilityBySource[id]&&availabilityBySource[id].verified?
+        availabilityBySource[id].episodes:null;
       var rowsForSource = root.items.filter(function (item) {
         if (!item || !item._provider || item._provider.id !== id) return false;
         var variant = item._watchVariant || {};
@@ -4469,7 +4514,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       return {
         title: 'PluginLampa · ' + label,
         // Keep the actual Cinemeta season list on our page while sources are visible.
-        items: seasonEntries.map(function (episode) {
+        items: seasonEntries.filter(function(ep){return !confirmed||confirmed.indexOf(ep.season+':'+ep.episode)>=0;}).map(function (episode) {
           return {title:'Серия ' + episode.episode + (episode.title ? ' · ' + episode.title : ''),
             _nativeEpisode:episode,
             subtitle:(function(){
