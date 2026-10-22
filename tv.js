@@ -2288,6 +2288,8 @@ SOFTWARE.
         recordProviderSuccess(provider, streams.length);
         rememberStreams(movie, provider, item, streams);
       }
+      // For direct one-click resolution pick the greatest known resolution.
+      // Manual translation selection still opens the complete quality list.
       if (provider.id === 'collaps-direct' && streams.length === 1 &&
           activeNativePage && activeNativePage.isAlive()) {
         chooseStream(item, streams[0], movie, provider);
@@ -2302,6 +2304,8 @@ SOFTWARE.
       if(episodeAuto) {
         // Max explicit resolution wins; HLS AUTO is fallback when unranked.
         var selected=highestQualityStream(streams);
+        // Prefer explicit maximum height over a generic HLS AUTO option.
+        // AUTO only wins when no finite resolution is advertised.
         // Do not pick an arbitrary episode from multi-episode playlists.
         var episodes=Object.create(null);
         streams.forEach(function(v){if(v.episodeNumber)episodes[String(v.episodeNumber)]=true;});
@@ -4679,8 +4683,8 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
             _nativeProgressRow:true};
         }).concat(selectedEpisode ? rowsForSource.map(function(entry){
           return {title:'Озвучка · '+String(entry._watchVariant&&entry._watchVariant.translation||
-              entry.title||'Оригинал'),
-            subtitle:'Выбрать перевод и качество',_nativeAtodoVariant:entry};
+              entry._item&&entry._item.translation||entry.title||'Оригинал'),
+            subtitle:'Открыть все варианты качества',_nativeAtodoVariant:entry};
         }) : rowsForSource),
         onSelect: function (item) {
           if (!alive || !isActive()) return;
