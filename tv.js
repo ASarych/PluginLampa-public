@@ -2129,6 +2129,9 @@ SOFTWARE.
       }
       if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
       L.Player.play(playback);
+      try {if(video&&video.quality)
+        L.Storage.set('pluginlampa_preferred_quality_v1',String(video.quality));}
+      catch(_){}
       progressWatch(movie);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
@@ -2246,6 +2249,27 @@ SOFTWARE.
         // instead of leaving an abandoned loading menu on Escape.
         if (returnToResults) returnToResults();
         return;
+      }
+      var episodeAuto=movie.media_type==='tv'&&activeNativePage &&
+        typeof activeNativePage.consumeEpisodeAutoStream==='function' &&
+        activeNativePage.consumeEpisodeAutoStream();
+      if(episodeAuto) {
+        var desired='';
+        try {desired=String(L.Storage.get('pluginlampa_preferred_quality_v1','AUTO')||'AUTO');}
+        catch(_){}
+        var exact=streams.filter(function(v){return String(v.quality||'')===desired;})[0];
+        var fallback=streams.filter(function(v){return v.transport==='hls';})[0]||
+          streams.filter(function(v){return String(v.quality)==='720p';})[0]||
+          streams[0];
+        var selected=exact||fallback;
+        // Do not pick an arbitrary episode from multi-episode playlists.
+        var episodes=Object.create(null);
+        streams.forEach(function(v){if(v.episodeNumber)episodes[String(v.episodeNumber)]=true;});
+        if(Object.keys(episodes).length<2&&selected){
+          chooseStream(item,selected,movie,provider);
+          if(returnToResults)returnToResults();
+          return;
+        }
       }
       showStreamOptions(streams, item, provider, movie, returnToResults, saved, generation);
     }).catch(function (err) {
@@ -4177,6 +4201,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
     var firstSeriesOpened = false;
     var selectedEpisode = null;
     var autoplayEpisodeKey = '';
+    var autoplayResolvedStream=false;
     var seasonEntries = [];
     var availabilityBySource=Object.create(null);
     var seasonOpen = null;
@@ -4524,9 +4549,12 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       engine.getEpisodeAvailability(id,movie).then(function(result){
         if(!alive)return;
         availabilityBySource[id]=result&&result.verified?result:{verified:false};
-        if(chosenSource===id&&menu&&menu.title==='PluginLampa · '+(
-            root.items.filter(function(x){return x&&x._provider&&x._provider.id===id;})[0]||{}
-          )._provider && (root.items.filter(function(x){return x&&x._provider&&x._provider.id===id;})[0]||{})._provider.name)renderMenu(sourceMenu(root,id));
+        var entry=root.items.filter(function(x){
+          return x&&x._provider&&x._provider.id===id;
+        })[0];
+        var label=entry&&entry._provider?entry._provider.name:id;
+        if(chosenSource===id&&menu&&menu.title==='PluginLampa · '+label)
+          renderMenu(sourceMenu(root,id));
       });
     }
     function sourceMenu(root, id) {
@@ -4647,6 +4675,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
     this.playbackPreferences = function () {
       return {source:chosenSource,audio:chosenTranslation,quality:chosenQuality};
     };
+    this.consumeEpisodeAutoStream = function () {
+      var value=autoplayResolvedStream;
+      autoplayResolvedStream=false;
+      return value;
+    };
     this.isAlive = function () { return alive; };
     this.setSeasonEpisodes = function (items, select, changeSeason, season) {
       if (!alive) return;
@@ -4713,7 +4746,10 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
             return entry && entry._provider && entry._provider.id === chosenSource && entry._item;
           })[0];
           autoplayEpisodeKey = '';
-          if (candidate && typeof next.onSelect === 'function') next.onSelect(candidate);
+          if (candidate && typeof next.onSelect === 'function') {
+            autoplayResolvedStream=true;
+            next.onSelect(candidate);
+          }
           else if (sourceExplicit && L.Noty && L.Noty.show) L.Noty.show('Выбранный источник не нашёл поток для этой серии');
         }
       } else renderMenu(next);
