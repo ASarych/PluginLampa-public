@@ -3529,7 +3529,15 @@ SOFTWARE.
               }, showSeasons, selected._season);
             }
             engine.displayMenu(episodeMenu); }
-            showEpisodes();
+            // Do not expose unlocalized episode rows before metadata resolves.
+            // The locale request runs once on season selection, not on episode click.
+            var metadataPresented=false;
+            function presentSeason(){
+              if(metadataPresented||!current())return;
+              metadataPresented=true;
+              showEpisodes();
+            }
+            var metadataFallback=setTimeout(presentSeason,5000);
             // Use Lampa's configured TMDB source: no embedded API key or new proxy.
             // Only replace a title when the response really contains Cyrillic.
             var tmdb=L && L.Api && L.Api.sources && L.Api.sources.tmdb;
@@ -3554,13 +3562,18 @@ SOFTWARE.
                          /^\/[a-zA-Z0-9/_-]+\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
                         entry.thumbnail='https://image.tmdb.org/t/p/w300'+loc.still_path;
                     });
+                    clearTimeout(metadataFallback);
+                    presentSeason();
                     if(window.LampaVideoFinderNativePage &&
                        typeof window.LampaVideoFinderNativePage.refreshEpisodeMetadata==='function')
                       window.LampaVideoFinderNativePage.refreshEpisodeMetadata(Number(selected._season));
                     // Keep metadata for subsequent menu renders; never steal
                     // focus back from another page when network finishes.
-                  },function(){});
-              }catch(_){}
+                  },function(){clearTimeout(metadataFallback);presentSeason();});
+              }catch(_){clearTimeout(metadataFallback);presentSeason();}
+            } else {
+              clearTimeout(metadataFallback);
+              presentSeason();
             }
           },
           onBack: function () {
