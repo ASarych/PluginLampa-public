@@ -1987,7 +1987,7 @@ SOFTWARE.
   var PROGRESS_KEY='pluginlampa_progress_v1';
   function progressId(movie) {
     var id=String(movie&&movie.tmdb_id||'');
-    if(!/^\\d+$/.test(id))return '';
+    if(!/^\d+$/.test(id))return '';
     var card=movie.card||{};
     var kind=movie.media_type==='tv'?'tv':'movie';
     if(kind==='movie')return kind+':'+id;
@@ -3494,7 +3494,7 @@ SOFTWARE.
             // Only replace a title when the response really contains Cyrillic.
             var tmdb=L && L.Api && L.Api.sources && L.Api.sources.tmdb;
             var tmdbId=String(movie.tmdb_id || (movie.card&&movie.card.id)||'');
-            if(/^\\d+$/.test(tmdbId)&&tmdb&&typeof tmdb.get==='function'){
+            if(/^\d+$/.test(tmdbId)&&tmdb&&typeof tmdb.get==='function'){
               try {
                 tmdb.get('tv/'+tmdbId+'/season/'+selected._season,
                   {language:'ru-RU'},function(details){
@@ -3509,7 +3509,7 @@ SOFTWARE.
                       var russian=String(loc.name||'');
                       if(/[а-яё]/i.test(russian))entry.title=short(russian);
                       if(typeof loc.still_path==='string'&&
-                         /^\/[a-zA-Z0-9/_-]+\\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
+                         /^\/[a-zA-Z0-9/_-]+\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
                         entry.thumbnail='https://image.tmdb.org/t/p/w300'+loc.still_path;
                     });
                     if(window.LampaVideoFinderNativePage &&
@@ -3925,7 +3925,7 @@ function provider(alias){
       m.media_type==='tv'&&!episode(m)?'Откройте конкретную серию':'Требуется TMDB ID';},
     availableEpisodes:function(m){
       // Exact catalogue availability, not a batch of stream resolves.
-      if(!enabled()||m.media_type!=='tv'||!/^\\d+$/.test(String(m.tmdb_id||'')))
+      if(!enabled()||m.media_type!=='tv'||!/^\d+$/.test(String(m.tmdb_id||'')))
         return Promise.resolve(null);
       return request(BASE+alias+'?id='+encodeURIComponent(String(m.tmdb_id))+'&type=tv')
         .then(function(response){
