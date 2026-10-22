@@ -2035,6 +2035,14 @@ SOFTWARE.
   function setProgressPreferences(next) {
     try { L.Storage.set('pluginlampa_progress_settings_v1',next); }catch(_){}
   }
+  function highestQualityStream(streams) {
+    var rated=streams.map(function(v,i){
+      var q=String(v&&v.quality||v&&v.title||'');
+      var match=q.match(/(2160|1440|1080|720|480|360|240|144)p?/i);
+      return {video:v,index:i,height:match?Number(match[1]):(/4k/i.test(q)?2160:0)};
+    }).sort(function(a,b){return b.height-a.height||a.index-b.index;});
+    return rated.length?rated[0].video:null;
+  }
   var activeProgressCleanup=null;
   function progressWatch(movie) {
     var id=progressId(movie);
@@ -2083,7 +2091,16 @@ SOFTWARE.
       }
       function tick(){save(false);}
       function pause(){save(true);}
-      function ended(){save(true);}
+      function ended(){
+        save(true);
+        if(!active||!mediaInitialized||!attached||!attached.ended||
+           movie.media_type!=='tv'||!activeNativePage||
+           typeof activeNativePage.playNextEpisode!=='function')return;
+        // Only the browser's actual ended event advances the series.
+        // Reaching the watched threshold or pressing Back never does.
+        if(activeProgressCleanup===cleanup)
+          activeNativePage.playNextEpisode(movie.card||{});
+      }
       el.addEventListener('loadedmetadata',ready);
       el.addEventListener('playing',ready);
       el.addEventListener('timeupdate',tick);
@@ -2142,9 +2159,6 @@ SOFTWARE.
       }
       if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
       L.Player.play(playback);
-      try {if(video&&video.quality)
-        L.Storage.set('pluginlampa_preferred_quality_v1',String(video.quality));}
-      catch(_){}
       progressWatch(movie);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
@@ -2267,14 +2281,8 @@ SOFTWARE.
         typeof activeNativePage.consumeEpisodeAutoStream==='function' &&
         activeNativePage.consumeEpisodeAutoStream();
       if(episodeAuto) {
-        var desired='';
-        try {desired=String(L.Storage.get('pluginlampa_preferred_quality_v1','AUTO')||'AUTO');}
-        catch(_){}
-        var exact=streams.filter(function(v){return String(v.quality||'')===desired;})[0];
-        var fallback=streams.filter(function(v){return v.transport==='hls';})[0]||
-          streams.filter(function(v){return String(v.quality)==='720p';})[0]||
-          streams[0];
-        var selected=exact||fallback;
+        // Max explicit resolution wins; HLS AUTO is fallback when unranked.
+        var selected=highestQualityStream(streams);
         // Do not pick an arbitrary episode from multi-episode playlists.
         var episodes=Object.create(null);
         streams.forEach(function(v){if(v.episodeNumber)episodes[String(v.episodeNumber)]=true;});
@@ -4367,22 +4375,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
           renderMenu({title:'Настройки просмотра',items:[
             {title:'Возобновление: '+(p.resume?'включено':'выключено'),_progressSetting:'resume'},
             {title:'Просмотрено после: '+p.watchedPercent+'%',_progressSetting:'threshold'},
-            {title:'Качество по умолчанию',_progressSetting:'quality'},
+
             {title:'Перевод по умолчанию: '+String(L.Storage.get('pluginlampa_preferred_translation_v1','')||'авто').slice(0,60),_progressSetting:'voice'}
           ],onSelect:function(item){
             if(!item||!item._progressSetting)return;
             var current=api.settings();
-            if(item._progressSetting==='quality'){
-              renderMenu({title:'Качество по умолчанию',items:
-                ['AUTO','360p','480p','720p','1080p'].map(function(q){
-                  return {title:q,_preferredQuality:q};
-                }),onSelect:function(q){
-                  if(!q)return;
-                  try{L.Storage.set('pluginlampa_preferred_quality_v1',q._preferredQuality);}catch(_){}
-                  renderMenu(previous);
-                },onBack:function(){renderMenu(previous);}});
-              return;
-            }
             if(item._progressSetting==='voice'){
               try{L.Storage.set('pluginlampa_preferred_translation_v1','');}catch(_){}
               renderMenu(previous);return;
@@ -4747,6 +4744,21 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       seasonOpen = typeof select === 'function' ? select : null;
       seasonChooser = typeof changeSeason === 'function' ? changeSeason : null;
       currentSeason = Number(season) || (seasonEntries[0] && Number(seasonEntries[0].season)) || null;
+    };
+    this.playNextEpisode = function(card) {
+      if(!alive||!selectedEpisode||typeof seasonOpen!=='function')return false;
+      var sn=Number(card.season_number||card.season);
+      var en=Number(card.episode_number||card.episode);
+      if(sn!==Number(selectedEpisode.season)||en!==Number(selectedEpisode.episode))
+        return false;
+      var next=seasonEntries.filter(function(e){
+        return Number(e.season)===sn&&Number(e.episode)===en+1;
+      })[0];
+      if(!next)return false;
+      // The source's availability is checked again during normal episode search.
+      autoplayEpisodeKey=String(next.season)+':'+String(next.episode);
+      seasonOpen(next);
+      return true;
     };
     this.requestEpisodeAutoplay = function (season, episode) {
       autoplayEpisodeKey = String(season)+':'+String(episode);
