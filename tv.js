@@ -3521,6 +3521,8 @@ SOFTWARE.
                       if(!entry)return;
                       var russian=String(loc.name||'');
                       if(/[а-яё]/i.test(russian))entry.title=short(russian);
+                      if(typeof loc.overview==='string'&&/[а-яё]/i.test(loc.overview))
+                        entry.description=loc.overview.slice(0,220);
                       if(typeof loc.still_path==='string'&&
                          /^\/[a-zA-Z0-9/_-]+\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
                         entry.thumbnail='https://image.tmdb.org/t/p/w300'+loc.still_path;
@@ -4190,6 +4192,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       '.pluginlampa-heading{font-size:1.05em;opacity:.7;margin:.8em 0}' +
       '.pluginlampa-native-rows{padding:.5em .65em}' +
       '.pluginlampa-episode-still{width:7em;height:4em;object-fit:cover;float:left;margin-right:.9em;border-radius:.3em}' +
+      '.pluginlampa-episode-synopsis{opacity:.7;font-size:.8em;max-height:2.7em;overflow:hidden}' +
       '.pluginlampa-toolbar{display:flex;gap:.6em;flex-wrap:wrap;margin-bottom:1em}' +
       '.pluginlampa-control{padding:.7em 1em;background:rgba(0,0,0,.25);border-radius:.3em}' +
       '.pluginlampa-control.focus{outline:.17em solid #fff;background:rgba(255,255,255,.2)}' +
@@ -4511,6 +4514,11 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         }
         body.append(title);
         body.append(subtitle);
+        if(item&&item._nativeEpisode&&item._nativeEpisode.description){
+          var synopsis=jq('<div class="pluginlampa-episode-synopsis"></div>');
+          synopsis.text(String(item._nativeEpisode.description).slice(0,220));
+          body.append(synopsis);
+        }
         row.append(body);
         var activateRow = function () {
           if (!alive || token !== generation || !isActive()) {activationDiagnostic('row-guard',item&&item._nativeEpisode?'episode':'source',token);return;}
