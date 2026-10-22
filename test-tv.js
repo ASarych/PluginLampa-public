@@ -41,12 +41,21 @@ const afterRestart=initialize(store);
 assert.equal(afterRestart.api.get(ep2).position,1122,'resume survives plugin restart');
 assert.equal(afterRestart.api.settings().resume,false);
 assert.equal(afterRestart.api.settings().watchedPercent,95);
+assert.equal(typeof afterRestart.api.mark,'function');
+assert.equal(afterRestart.api.mark(ep2,true),true);
+assert.equal(afterRestart.api.get(ep2).watched,true);
+assert.equal(afterRestart.api.mark(ep2,false),true);
+assert.equal(afterRestart.api.get(ep2),null);
+first.write(first.api.progressId(ep2),1122,2400,false);
+
 assert(!JSON.stringify(Array.from(store.values())).includes('https://'),'no media URL persisted');
 assert(!source.includes('Подключить Онлайн Мод'),'removed online-mod installer stays removed');
 assert(!source.includes('Rezka ·'),'removed Rezka route stays removed');
 assert(source.includes("L.Storage.get(KEY,false)"),'Atodo stays opt-in');
 assert(source.includes('getEpisodeAvailability:'),'source catalogue availability API wired');
 assert(source.includes('refreshEpisodeMetadata'),'Russian episode updates refresh native rows');
+assert(source.includes('consumeEpisodeAutoStream'),'single episode selection consumes auto playback intent');
+assert(source.includes('availableEpisodes:function(m)'), 'Atodo catalogue adapter present');
 function video(){
   const callbacks=new Map();
   return {readyState:0, currentTime:0,duration:1800,ended:false,
@@ -62,4 +71,4 @@ media.currentTime=1250;media.fire('pause');
 assert.equal(active.api.get(ep2).position,1250);
 media.currentTime=1660;media.fire('ended');
 assert.equal(active.api.get(ep2).watched,true);
-console.log('PASS: tv.js syntax, episode identity, persist/restore, event update, settings, no signed URL persistence, opt-in providers');
+console.log('PASS: tv.js syntax, stable identities, restart resume, media events, settings, watched toggle, no signed URL persistence, opt-in providers');
