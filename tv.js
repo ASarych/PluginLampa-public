@@ -2014,6 +2014,16 @@ SOFTWARE.
       watched:!!completed,updated:Date.now()};
     try{L.Storage.set(PROGRESS_KEY,data);}catch(_){}
   }
+  function progressMark(movie,watched) {
+    var id=progressId(movie);if(!id)return false;
+    var data=progressRead();
+    if(watched) {
+      var old=data[id]||{};
+      data[id]={position:Number(old.duration)||0,duration:Number(old.duration)||0,
+        watched:true,updated:Date.now()};
+    } else delete data[id];
+    try{L.Storage.set(PROGRESS_KEY,data);return true;}catch(_){return false;}
+  }
   function progressPreferences() {
     try {
       var p=L.Storage.get('pluginlampa_progress_settings_v1',{});
@@ -2092,7 +2102,7 @@ SOFTWARE.
     var timer=setInterval(inspect,300);
     inspect();
   }
-  window.PluginLampaProgress={get:progressItem,progressId:progressId,settings:progressPreferences,setSettings:setProgressPreferences};
+  window.PluginLampaProgress={get:progressItem,progressId:progressId,mark:progressMark,settings:progressPreferences,setSettings:setProgressPreferences};
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
     if (!stream) {
@@ -4335,6 +4345,15 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         controlRows.push({node:button[0],focus:focusControl,activate:activateControlOnce,kind:'control'});
         toolbar.append(button);
       }
+      if(selectedEpisode&&window.PluginLampaProgress&&window.PluginLampaProgress.mark) {
+        var selectedForProgress={tmdb_id:movie.id||movie.tmdb_id,media_type:'tv',
+          card:{season_number:selectedEpisode.season,episode_number:selectedEpisode.episode}};
+        var savedForProgress=window.PluginLampaProgress.get(selectedForProgress);
+        control(savedForProgress&&savedForProgress.watched?'✓ Снять отметку':'✓ Отметить просмотренным',function(){
+          window.PluginLampaProgress.mark(selectedForProgress,!(savedForProgress&&savedForProgress.watched));
+          draw();
+        });
+      }
       // Native settings stay inside the plugin; no global Lampa setting changes.
       if (engine && window.PluginLampaProgress && typeof window.PluginLampaProgress.settings==='function') {
         control('⚙ Просмотр', function(){
@@ -4658,6 +4677,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
           }
           if (item._nativeSource) {
             chosenSource = item._nativeSource;
+            try{L.Storage.set('pluginlampa_last_source_v1',chosenSource);}catch(_){}
             sourceExplicit = true;
             chosenQuality = '';
             chosenTranslation = '';
@@ -4741,10 +4761,16 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         // The source selector above the list remains available for switching.
         var episodeCard = selectedEpisode && selectedEpisode.season && selectedEpisode.episode;
         if (episodeCard && !chosenSource && !sourceExplicit) {
-          next.items.some(function (entry) {
-            if (!entry || !entry._watchVariant || !entry._provider) return false;
-            chosenSource = entry._provider.id;
-            return true;
+          var favorite='';
+          try{favorite=String(L.Storage.get('pluginlampa_last_source_v1','')||'');}catch(_){}
+          if(favorite)next.items.some(function(entry){
+            if(entry&&entry._watchVariant&&entry._provider&&entry._provider.id===favorite){
+              chosenSource=favorite;return true;
+            }return false;
+          });
+          if(!chosenSource)next.items.some(function(entry){
+            if(!entry||!entry._watchVariant||!entry._provider)return false;
+            chosenSource=entry._provider.id;return true;
           });
         }
         renderMenu(chosenSource ? sourceMenu(next, chosenSource) : sourceChooser(next));
