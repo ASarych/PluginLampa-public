@@ -3430,6 +3430,33 @@ SOFTWARE.
             }
             engine.displayMenu(episodeMenu); }
             showEpisodes();
+            // Use Lampa's configured TMDB source: no embedded API key or new proxy.
+            // Only replace a title when the response really contains Cyrillic.
+            var tmdb=L && L.Api && L.Api.sources && L.Api.sources.tmdb;
+            var tmdbId=String(movie.tmdb_id || (movie.card&&movie.card.id)||'');
+            if(/^\\d+$/.test(tmdbId)&&tmdb&&typeof tmdb.get==='function'){
+              try {
+                tmdb.get('tv/'+tmdbId+'/season/'+selected._season,
+                  {language:'ru-RU'},function(details){
+                    if(!current()||!details||!Array.isArray(details.episodes)||
+                       Number(details.season_number)!==Number(selected._season))return;
+                    details.episodes.forEach(function(loc){
+                      var entry=episodes.filter(function(ep){
+                        return ep.episode===Number(loc.episode_number)&&
+                          ep.season===Number(loc.season_number);
+                      })[0];
+                      if(!entry)return;
+                      var russian=String(loc.name||'');
+                      if(/[а-яё]/i.test(russian))entry.title=short(russian);
+                      if(typeof loc.still_path==='string'&&
+                         /^\/[a-zA-Z0-9/_-]+\\.(?:jpg|jpeg|png|webp)$/.test(loc.still_path))
+                        entry.thumbnail='https://image.tmdb.org/t/p/w300'+loc.still_path;
+                    });
+                    // Keep metadata for subsequent menu renders; never steal
+                    // focus back from another page when network finishes.
+                  },function(){});
+              }catch(_){}
+            }
           },
           onBack: function () {
             if (current()) engine.open(movie.card || {});
