@@ -1,4 +1,5 @@
-// PluginLampa v0.6.4 · Archive + Rutube + Stremio + AniLiberty + KB.
+// PluginLampa build 2026.10.23.1 · published TV distribution.
+// PluginLampa v0.6.5 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
 /*
@@ -1280,6 +1281,24 @@ SOFTWARE.
   'use strict';
 
   if (window.__lampa_video_finder_v1) return;
+  var BUILD_ID='2026.10.23.1';
+  var UPDATE_URL='https://asarych.github.io/PluginLampa-public/tv.js';
+  window.PluginLampaBuild=BUILD_ID;
+  function checkBuildUpdate(done) {
+    if(typeof fetch!=='function'){done('Проверка недоступна: fetch не поддерживается');return;}
+    var url=UPDATE_URL+'?pluginlampa_check='+Date.now();
+    fetch(url,{cache:'no-store'}).then(function(response){
+      if(!response.ok)throw Error('HTTP '+response.status);
+      return response.text();
+    }).then(function(source){
+      var match=/var BUILD_ID='([^']{1,40})';/.exec(source);
+      if(!match){done('Версия на GitHub Pages не определена');return;}
+      if(match[1]===BUILD_ID)done('Установлена актуальная сборка '+BUILD_ID);
+      else done('На GitHub Pages сборка '+match[1]+'; запущена '+BUILD_ID+'. Перезапусти MSX/Lampa.');
+    }).catch(function(){
+      done('Не удалось проверить GitHub Pages: сеть или CORS');
+    });
+  }
   var L = window.Lampa;
   if (!L || !L.Manifest || !L.Listener || !L.Storage || !L.Noty || !L.Select || !L.Player) {
     console.warn('[PluginLampa] Lampa is not ready; no plugin hooks installed');
@@ -4368,6 +4387,16 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
           draw();
         });
       }
+      control('Версия: '+(window.PluginLampaBuild||'неизвестно'), function() {
+        if(L.Noty&&L.Noty.show)L.Noty.show('PluginLampa '+BUILD_ID);
+      });
+      control('Проверить обновление',function(){
+        if(L.Noty&&L.Noty.show)L.Noty.show('Проверяю GitHub Pages...');
+        checkBuildUpdate(function(message){
+          if(!alive)return;
+          if(L.Noty&&L.Noty.show)L.Noty.show(message,{time:8500});
+        });
+      });
       // Native settings stay inside the plugin; no global Lampa setting changes.
       if (engine && window.PluginLampaProgress && typeof window.PluginLampaProgress.settings==='function') {
         control('⚙ Просмотр', function(){
