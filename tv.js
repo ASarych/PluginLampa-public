@@ -2014,6 +2014,17 @@ SOFTWARE.
       watched:!!completed,updated:Date.now()};
     try{L.Storage.set(PROGRESS_KEY,data);}catch(_){}
   }
+  function progressPreferences() {
+    try {
+      var p=L.Storage.get('pluginlampa_progress_settings_v1',{});
+      if(typeof p==='string')p=JSON.parse(p);
+      return {resume:!(p&&p.resume===false),
+        watchedPercent:p&&Number(p.watchedPercent)===95?95:90};
+    }catch(_){return {resume:true,watchedPercent:90};}
+  }
+  function setProgressPreferences(next) {
+    try { L.Storage.set('pluginlampa_progress_settings_v1',next); }catch(_){}
+  }
   function progressWatch(movie) {
     var id=progressId(movie);
     if(!id||!L.PlayerVideo||typeof L.PlayerVideo.video!=='function')return;
@@ -2028,13 +2039,13 @@ SOFTWARE.
         if(!attached||el!==attached)return;
         var t=Number(el.currentTime),d=Number(el.duration);
         if(!Number.isFinite(d)||d<30||!Number.isFinite(t))return;
-        var end=el.ended||t/d>=0.92;
+        var end=el.ended||t/d>=progressPreferences().watchedPercent/100;
         if(force||end||Date.now()-lastWrite>10000){
           lastWrite=Date.now();progressWrite(id,t,d,end);
         }
       }
       function onReady(){
-        if(!previous||previous.watched||previous.position<20)return;
+        if(!progressPreferences().resume||!previous||previous.watched||previous.position<20)return;
         var d=Number(el.duration);
         if(!Number.isFinite(d)||d<30||previous.position>=d-20)return;
         try{el.currentTime=previous.position;}catch(_){}
@@ -2050,7 +2061,7 @@ SOFTWARE.
     var timer=setInterval(inspect,400);
     inspect();
   }
-  window.PluginLampaProgress={get:progressItem,progressId:progressId};
+  window.PluginLampaProgress={get:progressItem,progressId:progressId,settings:progressPreferences,setSettings:setProgressPreferences};
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
     if (!stream) {
@@ -4052,6 +4063,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       '.pluginlampa-film-info{opacity:.75;font-size:.85em;margin:.5em 0;line-height:1.5}' +
       '.pluginlampa-heading{font-size:1.05em;opacity:.7;margin:.8em 0}' +
       '.pluginlampa-native-rows{padding:.5em .65em}' +
+      '.pluginlampa-episode-still{width:7em;height:4em;object-fit:cover;float:left;margin-right:.9em;border-radius:.3em}' +
       '.pluginlampa-toolbar{display:flex;gap:.6em;flex-wrap:wrap;margin-bottom:1em}' +
       '.pluginlampa-control{padding:.7em 1em;background:rgba(0,0,0,.25);border-radius:.3em}' +
       '.pluginlampa-control.focus{outline:.17em solid #fff;background:rgba(255,255,255,.2)}' +
@@ -4208,6 +4220,22 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         controlRows.push({node:button[0],focus:focusControl,activate:activateControlOnce,kind:'control'});
         toolbar.append(button);
       }
+      // Native settings stay inside the plugin; no global Lampa setting changes.
+      if (engine && window.PluginLampaProgress && typeof window.PluginLampaProgress.settings==='function') {
+        control('⚙ Просмотр', function(){
+          var previous=menu,api=window.PluginLampaProgress,p=api.settings();
+          renderMenu({title:'Настройки просмотра',items:[
+            {title:'Возобновление: '+(p.resume?'включено':'выключено'),_progressSetting:'resume'},
+            {title:'Просмотрено после: '+p.watchedPercent+'%',_progressSetting:'threshold'}
+          ],onSelect:function(item){
+            if(!item||!item._progressSetting)return;
+            var current=api.settings();
+            if(item._progressSetting==='resume')current.resume=!current.resume;
+            if(item._progressSetting==='threshold')current.watchedPercent=current.watchedPercent===90?95:90;
+            api.setSettings(current);renderMenu(previous);
+          },onBack:function(){renderMenu(previous);}});
+        });
+      }
       if (seasonChooser && seasonEntries.length) {
         control('Сезон: ' + (currentSeason || seasonEntries[0].season), function () { seasonChooser(); });
       } else if (menu._nativeShowSeasons) {
@@ -4317,6 +4345,13 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         var subtitle = jq('<div class="online__quality"></div>');
         title.text(String(item && item.title != null ? item.title : 'Видео'));
         subtitle.text(String(item && item.subtitle != null ? item.subtitle : ''));
+        // Episode artwork is limited to visible/paged items; no extra API requests.
+        if(item&&item._nativeEpisode&&typeof item._nativeEpisode.thumbnail==='string'&&
+            /^https:\/\//i.test(item._nativeEpisode.thumbnail)) {
+          var still=jq('<img class="pluginlampa-episode-still" loading="lazy" alt="" />');
+          still.attr('src',item._nativeEpisode.thumbnail);
+          body.append(still);
+        }
         body.append(title);
         body.append(subtitle);
         row.append(body);
@@ -4409,8 +4444,16 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         // Keep the actual Cinemeta season list on our page while sources are visible.
         items: seasonEntries.map(function (episode) {
           return {title:'Серия ' + episode.episode + (episode.title ? ' · ' + episode.title : ''),
-            subtitle:selectedEpisode && Number(selectedEpisode.season) === Number(episode.season) && Number(selectedEpisode.episode) === Number(episode.episode) ? 'Выбрана' : '',
-            _nativeEpisode:episode};
+            _nativeEpisode:episode,
+            subtitle:(function(){
+              var base=selectedEpisode && Number(selectedEpisode.season) === Number(episode.season) &&
+                Number(selectedEpisode.episode) === Number(episode.episode) ? 'Выбрана' : '';
+              var info=window.PluginLampaProgress&&window.PluginLampaProgress.get({
+                tmdb_id:movie.id||movie.tmdb_id,media_type:'tv',
+                card:{season_number:episode.season,episode_number:episode.episode}});
+              return info?(info.watched?'✓ Просмотрено':('Продолжить '+Math.floor(info.position/60)+' мин')):base;
+            })(),
+            _unusedMarker:null};
         }).concat(seasonEntries.length ? [] : rowsForSource),
         onSelect: function (item) {
           if (!alive || !isActive()) return;
