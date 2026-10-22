@@ -59,6 +59,10 @@ assert(source.includes("this.playNextEpisode = function(card)"),'native next-epi
 assert(source.includes("el.addEventListener('ended',ended)"),'next episode follows real ended event');
 
 assert(source.includes('refreshEpisodeMetadata'),'Russian episode updates refresh native rows');
+assert(source.includes('function presentSeason()'), 'season list is gated on metadata or timeout');
+assert(source.includes('clearTimeout(metadataFallback);'), 'metadata loading cancels fallback');
+assert(source.includes('_nativeAtodoVariant:entry'), 'voice variants remain visible in source menu');
+assert(source.includes('Открыть все варианты качества'), 'manual resolution choices remain accessible');
 assert(source.includes('consumeEpisodeAutoStream'),'single episode selection consumes auto playback intent');
 assert(source.includes('availableEpisodes:function(m)'), 'Atodo catalogue adapter present');
 function video(){
