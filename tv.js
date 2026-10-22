@@ -4666,10 +4666,15 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       });
       var first = rowsForSource[0];
       var label = first && first._provider ? first._provider.name : id;
+      var variantRows=selectedEpisode?rowsForSource.map(function(entry){
+        return {title:'Озвучка · '+String(entry._watchVariant&&entry._watchVariant.translation||
+            entry._item&&entry._item.translation||entry.title||'Оригинал'),
+          subtitle:'Открыть все варианты качества',_nativeAtodoVariant:entry};
+      }):[];
       return {
         title: 'PluginLampa · ' + label,
         // Keep the actual Cinemeta season list on our page while sources are visible.
-        items: seasonEntries.filter(function(ep){return !confirmed||confirmed.indexOf(ep.season+':'+ep.episode)>=0;}).map(function (episode) {
+        items: variantRows.concat(seasonEntries.filter(function(ep){return !confirmed||confirmed.indexOf(ep.season+':'+ep.episode)>=0;}).map(function (episode) {
           return {title:'Серия ' + episode.episode + (episode.title ? ' · ' + episode.title : ''),
             _nativeEpisode:episode,
             subtitle:(function(){
@@ -4681,11 +4686,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
               return info?(info.watched?'✓ Просмотрено':('Продолжить '+Math.floor(info.position/60)+' мин')):base;
             })(),
             _nativeProgressRow:true};
-        }).concat(selectedEpisode ? rowsForSource.map(function(entry){
-          return {title:'Озвучка · '+String(entry._watchVariant&&entry._watchVariant.translation||
-              entry._item&&entry._item.translation||entry.title||'Оригинал'),
-            subtitle:'Открыть все варианты качества',_nativeAtodoVariant:entry};
-        }) : rowsForSource),
+        })).concat(seasonEntries.length ? [] : rowsForSource),
         onSelect: function (item) {
           if (!alive || !isActive()) return;
           if (item && item._nativeEpisode && !seasonOpen) {activationDiagnostic('seasonOpen-missing','episode',generation);return;}
