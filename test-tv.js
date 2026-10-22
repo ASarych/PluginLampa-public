@@ -53,6 +53,11 @@ assert(!source.includes('Подключить Онлайн Мод'),'removed onl
 assert(!source.includes('Rezka ·'),'removed Rezka route stays removed');
 assert(source.includes("L.Storage.get(KEY,false)"),'Atodo stays opt-in');
 assert(source.includes('getEpisodeAvailability:'),'source catalogue availability API wired');
+assert(source.includes('highestQualityStream(streams)'), 'automatic playback uses maximum quality');
+assert(!source.includes("pluginlampa_preferred_quality_v1"), 'manual quality preference removed');
+assert(source.includes("this.playNextEpisode = function(card)"),'native next-episode handler installed');
+assert(source.includes("el.addEventListener('ended',ended)"),'next episode follows real ended event');
+
 assert(source.includes('refreshEpisodeMetadata'),'Russian episode updates refresh native rows');
 assert(source.includes('consumeEpisodeAutoStream'),'single episode selection consumes auto playback intent');
 assert(source.includes('availableEpisodes:function(m)'), 'Atodo catalogue adapter present');
