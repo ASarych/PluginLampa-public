@@ -2025,40 +2025,71 @@ SOFTWARE.
   function setProgressPreferences(next) {
     try { L.Storage.set('pluginlampa_progress_settings_v1',next); }catch(_){}
   }
+  var activeProgressCleanup=null;
   function progressWatch(movie) {
     var id=progressId(movie);
-    if(!id||!L.PlayerVideo||typeof L.PlayerVideo.video!=='function')return;
-    var previous=progressItem(movie),started=Date.now(),attached=null,lastWrite=0,finished=false;
-    function inspect(){
-      if(finished||Date.now()-started>120000){clearInterval(timer);return;}
-      var el;
-      try{el=L.PlayerVideo.video();}catch(_){return;}
-      if(!el||el===attached||typeof el.addEventListener!=='function')return;
-      attached=el;
-      function save(force){
-        if(!attached||el!==attached)return;
-        var t=Number(el.currentTime),d=Number(el.duration);
-        if(!Number.isFinite(d)||d<30||!Number.isFinite(t))return;
-        var end=el.ended||t/d>=progressPreferences().watchedPercent/100;
-        if(force||end||Date.now()-lastWrite>10000){
-          lastWrite=Date.now();progressWrite(id,t,d,end);
-        }
+    if(activeProgressCleanup){activeProgressCleanup();activeProgressCleanup=null;}
+    if(!id)return;
+    var previous=progressItem(movie),started=Date.now(),active=true,attached=null,
+        lastWrite=0,cleanListeners=function(){};
+    function save(force){
+      if(!active||!attached)return;
+      var t=Number(attached.currentTime),d=Number(attached.duration);
+      if(!Number.isFinite(d)||d<30||!Number.isFinite(t))return;
+      var prior=progressItem(movie);
+      var end=attached.ended||t/d>=progressPreferences().watchedPercent/100||
+        !!(prior&&prior.watched);
+      if(force||end||Date.now()-lastWrite>=10000){
+        lastWrite=Date.now();progressWrite(id,t,d,end);
       }
-      function onReady(){
-        if(!progressPreferences().resume||!previous||previous.watched||previous.position<20)return;
-        var d=Number(el.duration);
-        if(!Number.isFinite(d)||d<30||previous.position>=d-20)return;
+    }
+    function cleanup(){
+      if(!active)return;
+      save(true);
+      active=false;clearInterval(timer);cleanListeners();
+    }
+    activeProgressCleanup=cleanup;
+    function inspect(){
+      if(!active)return;
+      if(Date.now()-started>120000){clearInterval(timer);return;}
+      var el;
+      try{el=L.PlayerVideo&&typeof L.PlayerVideo.video==='function'?
+        L.PlayerVideo.video():null;}catch(_){return;}
+      if(!el||el===attached||typeof el.addEventListener!=='function')return;
+      cleanListeners();
+      attached=el;
+      var resumed=false;
+      function ready(){
+        if(resumed||!active||el!==attached)return;
+        resumed=true;
+        if(!progressPreferences().resume||!previous||previous.watched||
+           previous.position<20)return;
+        var duration=Number(el.duration);
+        if(!Number.isFinite(duration)||duration<30||
+           previous.position>=duration-20)return;
         try{el.currentTime=previous.position;}catch(_){}
         previous=null;
       }
-      el.addEventListener('loadedmetadata',onReady,{once:true});
-      el.addEventListener('timeupdate',function(){save(false);});
-      el.addEventListener('pause',function(){save(true);});
-      el.addEventListener('ended',function(){save(true);finished=true;clearInterval(timer);});
-      if(el.readyState>=1)onReady();
+      function tick(){save(false);}
+      function pause(){save(true);}
+      function ended(){save(true);}
+      el.addEventListener('loadedmetadata',ready);
+      el.addEventListener('timeupdate',tick);
+      el.addEventListener('pause',pause);
+      el.addEventListener('ended',ended);
+      cleanListeners=function(){
+        try{
+          el.removeEventListener('loadedmetadata',ready);
+          el.removeEventListener('timeupdate',tick);
+          el.removeEventListener('pause',pause);
+          el.removeEventListener('ended',ended);
+        }catch(_){}
+      };
+      // Do not seek using readyState of a reused element before the new
+      // playback's loadedmetadata event has identified its media.
       clearInterval(timer);
     }
-    var timer=setInterval(inspect,400);
+    var timer=setInterval(inspect,300);
     inspect();
   }
   window.PluginLampaProgress={get:progressItem,progressId:progressId,settings:progressPreferences,setSettings:setProgressPreferences};
@@ -4495,7 +4526,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         availabilityBySource[id]=result&&result.verified?result:{verified:false};
         if(chosenSource===id&&menu&&menu.title==='PluginLampa · '+(
             root.items.filter(function(x){return x&&x._provider&&x._provider.id===id;})[0]||{}
-          )._provider?.name)renderMenu(sourceMenu(root,id));
+          )._provider && (root.items.filter(function(x){return x&&x._provider&&x._provider.id===id;})[0]||{})._provider.name)renderMenu(sourceMenu(root,id));
       });
     }
     function sourceMenu(root, id) {
@@ -4525,7 +4556,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
                 card:{season_number:episode.season,episode_number:episode.episode}});
               return info?(info.watched?'✓ Просмотрено':('Продолжить '+Math.floor(info.position/60)+' мин')):base;
             })(),
-            _unusedMarker:null};
+            _nativeProgressRow:true};
         }).concat(seasonEntries.length ? [] : rowsForSource),
         onSelect: function (item) {
           if (!alive || !isActive()) return;
