@@ -2394,9 +2394,13 @@ SOFTWARE.
         activeNativePage.consumeEpisodeAutoStream();
       if(episodeAuto) {
         // Max explicit resolution wins; HLS AUTO is fallback when unranked.
-        var selected=(provider.id==='atodo-jator'||provider.id==='atodo-xinu')?
-          (bestAtodoHttpStream(streams)||highestQualityStream(streams)):
-          highestQualityStream(streams);
+        var selected=highestQualityStream(streams);
+        // Prefer the greatest explicit resolution across HLS and HTTP.
+        // Atodo exposes HLS qualities directly; AUTO is not a quality level.
+        if(provider.id==='atodo-jator'||provider.id==='atodo-xinu') {
+          var explicit=streams.filter(function(v){return v&&v.quality!=='AUTO';});
+          if(explicit.length)selected=highestQualityStream(explicit);
+        }
         // Prefer explicit maximum height over a generic HLS AUTO option.
         // AUTO only wins when no finite resolution is advertised.
         // Do not pick an arbitrary episode from multi-episode playlists.
@@ -4072,6 +4076,13 @@ function streams(alias,data){
   var v=root&&root.streams&&root.streams.video;
   if(!v)return [];
   var out=[],hls=v.hls&&safeUrl(v.hls.master);
+  var hlsQualities=v.hls&&v.hls.qualities;
+  if(hlsQualities&&typeof hlsQualities==='object'&&!Array.isArray(hlsQualities))
+    Object.keys(hlsQualities).filter(function(q){return /^[1-9]\d{1,3}$/.test(q)&&Number(q)<=4320;})
+      .sort(function(a,b){return Number(b)-Number(a);})
+      .forEach(function(q){var u=safeUrl(hlsQualities[q]);if(u)out.push({
+        title:'HLS '+q+'p',subtitle:'Atodo '+alias,url:u,quality:q+'p',
+        transport:'hls',_hlsVariantPinned:true});});
   if(hls)out.push({title:'HLS · Авто',subtitle:'Atodo '+alias,url:hls,quality:'AUTO',transport:'hls'});
   var qs=v.http&&v.http.qualities;
   if(qs&&typeof qs==='object'&&!Array.isArray(qs))
