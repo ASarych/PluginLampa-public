@@ -86,4 +86,7 @@ assert(source.includes('items: ordered'), 'manual quality menu retains options')
 assert(source.includes('function bestHlsRendition(master)'), 'Atodo HLS picks explicit rendition');
 assert(source.includes("video._hlsVariantPinned"), 'HLS rendition selection does not recurse');
 assert(source.includes('BANDWIDTH='), 'HLS playlist bitrate is parsed for ranking');
+assert(source.includes('var hlsQualities=v.hls&&v.hls.qualities'), 'Atodo API HLS quality map consumed');
+assert(source.includes('_hlsVariantPinned:true'), 'Atodo explicit HLS renditions skip master parsing');
+assert(source.includes("var explicit=streams.filter(function(v){return v&&v.quality!=='AUTO';});"), 'Atodo auto playback prefers explicit qualities');
 console.log('PASS: tv.js syntax, stable identities, restart resume, media events, settings, watched toggle, no signed URL persistence, opt-in providers');
