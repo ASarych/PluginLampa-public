@@ -1,4 +1,4 @@
-// PluginLampa build 2026.10.23.3 · published TV distribution.
+// PluginLampa build 2026.10.23.4 · published TV distribution.
 // PluginLampa v0.6.5 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
@@ -1281,7 +1281,7 @@ SOFTWARE.
   'use strict';
 
   if (window.__lampa_video_finder_v1) return;
-  var BUILD_ID='2026.10.23.3';
+  var BUILD_ID='2026.10.23.4';
   var UPDATE_URL='https://asarych.github.io/PluginLampa-public/tv.js';
   window.PluginLampaBuild=BUILD_ID;
   function checkBuildUpdate(done) {
@@ -2100,6 +2100,24 @@ SOFTWARE.
     }).sort(function(a,b){return b.height-a.height||a.index-b.index;});
     return rated.length?rated[0].video:null;
   }
+
+  // Native Lampa quality selector contract: Player.play({url, quality: {'720p': url}}).
+  // Use a single transport per menu so a quality switch cannot silently turn an
+  // HTTP file into an HLS manifest under the wrong playback engine.
+  function atodoNativeQualityMap(streams, transport) {
+    var chosen=Object.create(null), mapped={};
+    if(!Array.isArray(streams)||!(transport==='http'||transport==='hls'))return null;
+    streams.forEach(function(variant){
+      if(!variant||variant.transport!==transport)return;
+      var label=String(variant.quality||'');
+      if(!/^([1-9][0-9]{1,3})p$/.test(label)||Number(label.slice(0,-1))>4320)return;
+      var url=safePlaybackUrl(variant.url);
+      if(url&&!chosen[label])chosen[label]=url;
+    });
+    Object.keys(chosen).sort(function(a,b){return parseInt(a,10)-parseInt(b,10);})
+      .forEach(function(label){mapped[label]=chosen[label];});
+    return Object.keys(mapped).length>1?mapped:null;
+  }
   var activeProgressCleanup=null;
   function progressWatch(movie) {
     var id=progressId(movie);
@@ -2180,22 +2198,26 @@ SOFTWARE.
     inspect();
   }
   window.PluginLampaProgress={get:progressItem,progressId:progressId,mark:progressMark,settings:progressPreferences,setSettings:setProgressPreferences};
-  // Atodo AUTO may start at a 360p HLS variant even when higher variants exist.
-  // Resolve the master playlist to a concrete maximum BANDWIDTH rendition before play.
-  // Do not log, cache, or persist signed playlist URLs.
-  function bestHlsRendition(master) {
-    if(typeof fetch!=='function'||typeof URL!=='function')return Promise.resolve(null);
-    return fetch(master,{cache:'no-store'}).then(function(response){
-      if(!response.ok)throw Error('HLS master unavailable');
+  // Read only a bounded HLS master manifest; individual renditions remain in
+  // memory and only the manifest's actual RESOLUTION tags become quality labels.
+  function hlsMasterVariants(master) {
+    if(typeof fetch!=='function'||typeof URL!=='function')return Promise.resolve([]);
+    return fetch(master,{cache:'no-store',credentials:'omit'}).then(function(response){
+      if(!response.ok)throw Error('HLS manifest unavailable');
       return response.text();
     }).then(function(body){
-      if(typeof body!=='string'||body.length>1024*1024||body.indexOf('#EXTM3U')!==0)return null;
-      var lines=body.split(/\r?\n/),best=null;
+      if(typeof body!=='string'||body.length>1024*1024||
+          !/^\uFEFF?#EXTM3U/.test(body))return [];
+      var lines=body.split(/\r?\n/),byHeight=Object.create(null);
       for(var i=0;i<lines.length;i++){
         var line=lines[i].trim();
         if(line.indexOf('#EXT-X-STREAM-INF:')!==0)continue;
-        var info=line.slice(18),bit=/\bBANDWIDTH=(\d+)/.exec(info),
+        var info=line.slice(18),
+          bit=/\bBANDWIDTH=(\d+)/.exec(info),
           resolution=/\bRESOLUTION=(\d+)x(\d+)/.exec(info);
+        if(!resolution)continue;
+        var height=Number(resolution[2]),bandwidth=bit?Number(bit[1]):0;
+        if(!(height>0&&height<=4320))continue;
         var href='';
         for(var j=i+1;j<lines.length;j++){
           var next=lines[j].trim();
@@ -2204,28 +2226,36 @@ SOFTWARE.
           break;
         }
         if(!href)continue;
-        var candidate='';
-        try{candidate=safePlaybackUrl(new URL(href,master).href);}catch(_){}
-        if(!candidate)continue;
-        var height=resolution?Number(resolution[2]):0,
-          bandwidth=bit?Number(bit[1]):0;
-        if(!best||height>best.height||(height===best.height&&bandwidth>best.bandwidth))
-          best={url:candidate,height:height,bandwidth:bandwidth};
+        var url='';
+        try{url=safePlaybackUrl(new URL(href,master).href);}catch(_){}
+        if(!url)continue;
+        var old=byHeight[height];
+        if(!old||bandwidth>old.bandwidth)
+          byHeight[height]={url:url,bandwidth:bandwidth,height:height};
       }
-      return best;
-    }).catch(function(){return null;});
+      return Object.keys(byHeight).map(function(k){
+        var v=byHeight[k];
+        return {url:v.url,title:'HLS '+v.height+'p',quality:v.height+'p',
+          transport:'hls',_hlsVariantPinned:true};
+      }).sort(function(a,b){return parseInt(b.quality,10)-parseInt(a.quality,10);});
+    }).catch(function(){return [];});
   }
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
     var isAtodo=provider.id==='atodo-jator'||provider.id==='atodo-xinu';
     if(isAtodo&&video&&video.transport==='hls'&&!video._hlsVariantPinned&&stream){
-      bestHlsRendition(stream).then(function(best){
-        var selected=best?{
-          url:best.url,title:video.title,quality:best.height?best.height+'p':'HLS max',
-          transport:'hls',_hlsVariantPinned:true
-        }:{
-          url:stream,title:video.title,quality:'AUTO',transport:'hls',_hlsVariantPinned:true
-        };
+      // HLS AUTO alone is not a selectable high-quality rendition. If CORS
+      // allows reading the master, expose its *real* variants to Lampa.
+      hlsMasterVariants(stream).then(function(variants){
+        if(atodoQualitySession&&atodoQualitySession.item===item&&
+            atodoQualitySession.provider===provider&&variants.length){
+          atodoQualitySession.streams=atodoQualitySession.streams
+            .filter(function(v){return v.transport!=='hls'||v.quality!=='AUTO';})
+            .concat(variants);
+        }
+        var selected=highestQualityStream(variants)||{
+          url:stream,title:video.title,quality:'AUTO',transport:'hls',
+          _hlsVariantPinned:true};
         chooseStream(item,selected,movie,provider);
       });
       return;
@@ -2262,7 +2292,17 @@ SOFTWARE.
       } else if (transport === 'hls') {
         playback.hls = true;
       }
-      if (atodo) atodoPlaybackDiagnostic(provider, transport, playback, stream);
+      if (atodo) {
+        var session=atodoQualitySession;
+        var variants=session&&session.item===item&&session.provider===provider?
+          session.streams:[video];
+        var nativeQuality=atodoNativeQualityMap(variants,transport);
+        if(nativeQuality)playback.quality=nativeQuality;
+        // Lampa's own Panel -> Player quality handler resets the video source
+        // and calls Timeline.resetContinue(). A live timeline preserves position.
+        playback.timeline={time:0,percent:0,duration:0};
+        atodoPlaybackDiagnostic(provider,transport,playback,stream);
+      }
       L.Player.play(playback);
       if(atodo)inspectAtodoPicture(provider,video);
       progressWatch(movie);
@@ -2350,33 +2390,8 @@ SOFTWARE.
     });
   }
 
-  // In-memory only: source URLs may expire or contain tokens. Never persist them.
+  // URLs stay in this live, unsaved resolve session only.
   var atodoQualitySession=null;
-  function reopenAtodoQuality() {
-    var session=atodoQualitySession;
-    if(!session||!session.streams||!session.streams.length)return false;
-    var options=session.streams.slice().sort(function(a,b){
-      var qa=String(a.quality||''),qb=String(b.quality||'');
-      var na=parseInt(qa,10)||0,nb=parseInt(qb,10)||0;
-      return nb-na;
-    });
-    displayMenu({
-      title:'Atodo · сменить качество',
-      items:options.map(function(v){return {
-        title:String(v.title||v.quality||'AUTO'),
-        subtitle:String(v.transport||'').toUpperCase(),
-        _qualityStream:v};
-      }),
-      onSelect:function(choice){
-        if(!choice||!choice._qualityStream)return;
-        chooseStream(session.item,choice._qualityStream,session.movie,session.provider);
-      },
-      onBack:function(){if(session.returnToResults)session.returnToResults();}
-    });
-    return true;
-  }
-  window.PluginLampaAtodoQuality={open:reopenAtodoQuality,
-    available:function(){return !!(atodoQualitySession&&atodoQualitySession.streams&&atodoQualitySession.streams.length);}};
   var streamNavigationGeneration = 0;
   function openStreams(item, provider, movie, returnToResults) {
     var generation = ++streamNavigationGeneration;
@@ -2439,6 +2454,20 @@ SOFTWARE.
         streams.forEach(function(v){if(v.episodeNumber)episodes[String(v.episodeNumber)]=true;});
         if(Object.keys(episodes).length<2&&selected){
           chooseStream(item,selected,movie,provider);
+          if(returnToResults)returnToResults();
+          return;
+        }
+      }
+      if(provider.id==='atodo-jator'||provider.id==='atodo-xinu'){
+        // Translation selection starts the greatest *advertised* HTTP rendition.
+        // Lower and higher renditions remain available in Lampa's native player
+        // Quality menu; direct HTTP also avoids the Chrome HLS enabled error.
+        var best=bestAtodoHttpStream(streams)||
+          highestQualityStream(streams.filter(function(v){
+            return v&&v.transport==='hls'&&v.quality!=='AUTO';
+          }))||highestQualityStream(streams);
+        if(best){
+          chooseStream(item,best,movie,provider);
           if(returnToResults)returnToResults();
           return;
         }
@@ -4553,10 +4582,6 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       control('Версия: '+(window.PluginLampaBuild||'неизвестно'), function() {
         if(L.Noty&&L.Noty.show)L.Noty.show('PluginLampa '+BUILD_ID);
       });
-      if(window.PluginLampaAtodoQuality&&window.PluginLampaAtodoQuality.available())
-        control('Atodo · сменить качество',function(){
-          window.PluginLampaAtodoQuality.open();
-        });
       control('Диагностика Atodo',function(){
         var report=window.PluginLampaAtodoPicture;
         var message=report&&typeof report.text==='string'?
