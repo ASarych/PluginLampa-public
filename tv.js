@@ -1,4 +1,4 @@
-// PluginLampa build 2026.10.23.2 · published TV distribution.
+// PluginLampa build 2026.10.23.3 · published TV distribution.
 // PluginLampa v0.6.5 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
@@ -1281,7 +1281,7 @@ SOFTWARE.
   'use strict';
 
   if (window.__lampa_video_finder_v1) return;
-  var BUILD_ID='2026.10.23.2';
+  var BUILD_ID='2026.10.23.3';
   var UPDATE_URL='https://asarych.github.io/PluginLampa-public/tv.js';
   window.PluginLampaBuild=BUILD_ID;
   function checkBuildUpdate(done) {
@@ -2350,6 +2350,33 @@ SOFTWARE.
     });
   }
 
+  // In-memory only: source URLs may expire or contain tokens. Never persist them.
+  var atodoQualitySession=null;
+  function reopenAtodoQuality() {
+    var session=atodoQualitySession;
+    if(!session||!session.streams||!session.streams.length)return false;
+    var options=session.streams.slice().sort(function(a,b){
+      var qa=String(a.quality||''),qb=String(b.quality||'');
+      var na=parseInt(qa,10)||0,nb=parseInt(qb,10)||0;
+      return nb-na;
+    });
+    displayMenu({
+      title:'Atodo · сменить качество',
+      items:options.map(function(v){return {
+        title:String(v.title||v.quality||'AUTO'),
+        subtitle:String(v.transport||'').toUpperCase(),
+        _qualityStream:v};
+      }),
+      onSelect:function(choice){
+        if(!choice||!choice._qualityStream)return;
+        chooseStream(session.item,choice._qualityStream,session.movie,session.provider);
+      },
+      onBack:function(){if(session.returnToResults)session.returnToResults();}
+    });
+    return true;
+  }
+  window.PluginLampaAtodoQuality={open:reopenAtodoQuality,
+    available:function(){return !!(atodoQualitySession&&atodoQualitySession.streams&&atodoQualitySession.streams.length);}};
   var streamNavigationGeneration = 0;
   function openStreams(item, provider, movie, returnToResults) {
     var generation = ++streamNavigationGeneration;
@@ -2378,6 +2405,10 @@ SOFTWARE.
       if (!saved) {
         recordProviderSuccess(provider, streams.length);
         rememberStreams(movie, provider, item, streams);
+      }
+      if(provider.id==='atodo-jator'||provider.id==='atodo-xinu'){
+        atodoQualitySession={item:item,provider:provider,movie:movie,
+          streams:streams,returnToResults:returnToResults};
       }
       // For direct one-click resolution pick the greatest known resolution.
       // Manual translation selection still opens the complete quality list.
@@ -4522,6 +4553,10 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       control('Версия: '+(window.PluginLampaBuild||'неизвестно'), function() {
         if(L.Noty&&L.Noty.show)L.Noty.show('PluginLampa '+BUILD_ID);
       });
+      if(window.PluginLampaAtodoQuality&&window.PluginLampaAtodoQuality.available())
+        control('Atodo · сменить качество',function(){
+          window.PluginLampaAtodoQuality.open();
+        });
       control('Диагностика Atodo',function(){
         var report=window.PluginLampaAtodoPicture;
         var message=report&&typeof report.text==='string'?
