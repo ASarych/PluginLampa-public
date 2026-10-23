@@ -1,4 +1,4 @@
-// PluginLampa build 2026.10.23.1 · published TV distribution.
+// PluginLampa build 2026.10.23.2 · published TV distribution.
 // PluginLampa v0.6.5 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
@@ -1281,7 +1281,7 @@ SOFTWARE.
   'use strict';
 
   if (window.__lampa_video_finder_v1) return;
-  var BUILD_ID='2026.10.23.1';
+  var BUILD_ID='2026.10.23.2';
   var UPDATE_URL='https://asarych.github.io/PluginLampa-public/tv.js';
   window.PluginLampaBuild=BUILD_ID;
   function checkBuildUpdate(done) {
@@ -4783,6 +4783,9 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
         if (!item || !item._provider || item._provider.id !== id) return false;
         var variant = item._watchVariant || {};
         if (id === 'collaps-direct') return true; // selection applies to player track API
+        // Atodo translation rows must remain visible even after choosing one.
+        // Quality choices arrive from resolve(), not from _watchVariant.
+        if(id==='atodo-jator'||id==='atodo-xinu')return true;
         return (!chosenQuality || variant.quality === chosenQuality) &&
           (!chosenTranslation || variant.translation === chosenTranslation);
       });
@@ -4791,7 +4794,7 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       var variantRows=selectedEpisode?rowsForSource.map(function(entry){
         return {title:'Озвучка · '+String(entry._watchVariant&&entry._watchVariant.translation||
             entry._item&&entry._item.translation||entry.title||'Оригинал'),
-          subtitle:'Открыть все варианты качества',_nativeAtodoVariant:entry};
+          subtitle:'Выбрать HLS/HTTP качество вручную',_nativeAtodoVariant:entry};
       }):[];
       return {
         title: 'PluginLampa · ' + label,
