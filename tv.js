@@ -2084,6 +2084,14 @@ SOFTWARE.
   function setProgressPreferences(next) {
     try { L.Storage.set('pluginlampa_progress_settings_v1',next); }catch(_){}
   }
+  // Atodo HLS.js in current Lampa can throw on repeated audio/level "enabled"
+  // descriptors. Prefer a separately advertised HTTP rendition when available.
+  function bestAtodoHttpStream(streams) {
+    var direct=streams.filter(function(v){
+      return v&&v.transport==='http'&&typeof v.url==='string';
+    });
+    return direct.length?highestQualityStream(direct):null;
+  }
   function highestQualityStream(streams) {
     var rated=streams.map(function(v,i){
       var q=String(v&&v.quality||v&&v.title||'');
@@ -2280,9 +2288,13 @@ SOFTWARE.
       episodeMenu();
       return;
     }
+    var atodoSource=provider.id==='atodo-jator'||provider.id==='atodo-xinu';
+    var ordered=atodoSource?streams.slice().sort(function(a,b){
+      return (a.transport==='hls'?1:0)-(b.transport==='hls'?1:0);
+    }):streams;
     displayMenu({
       title: 'Видео · ' + item.title + (saved ? ' · из памяти' : ''),
-      items: streams,
+      items: ordered,
       onSelect: function (stream) {
         if (current()) chooseStream(item, stream, movie, provider);
       },
@@ -2334,7 +2346,9 @@ SOFTWARE.
         activeNativePage.consumeEpisodeAutoStream();
       if(episodeAuto) {
         // Max explicit resolution wins; HLS AUTO is fallback when unranked.
-        var selected=highestQualityStream(streams);
+        var selected=(provider.id==='atodo-jator'||provider.id==='atodo-xinu')?
+          (bestAtodoHttpStream(streams)||highestQualityStream(streams)):
+          highestQualityStream(streams);
         // Prefer explicit maximum height over a generic HLS AUTO option.
         // AUTO only wins when no finite resolution is advertised.
         // Do not pick an arbitrary episode from multi-episode playlists.
