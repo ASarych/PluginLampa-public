@@ -2190,12 +2190,12 @@ SOFTWARE.
       return response.text();
     }).then(function(body){
       if(typeof body!=='string'||body.length>1024*1024||body.indexOf('#EXTM3U')!==0)return null;
-      var lines=body.split(/\\r?\\n/),best=null;
+      var lines=body.split(/\r?\n/),best=null;
       for(var i=0;i<lines.length;i++){
         var line=lines[i].trim();
         if(line.indexOf('#EXT-X-STREAM-INF:')!==0)continue;
-        var info=line.slice(18),bit=/\\bBANDWIDTH=(\\d+)/.exec(info),
-          resolution=/\\bRESOLUTION=(\\d+)x(\\d+)/.exec(info);
+        var info=line.slice(18),bit=/\bBANDWIDTH=(\d+)/.exec(info),
+          resolution=/\bRESOLUTION=(\d+)x(\d+)/.exec(info);
         var href='';
         for(var j=i+1;j<lines.length;j++){
           var next=lines[j].trim();
