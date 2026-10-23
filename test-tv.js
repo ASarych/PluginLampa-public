@@ -83,4 +83,7 @@ assert.equal(active.api.get(ep2).watched,true);
 assert(source.includes('function bestAtodoHttpStream(streams)'), 'Atodo HTTP preference is implemented');
 assert(source.includes('bestAtodoHttpStream(streams)||highestQualityStream(streams)'), 'Atodo autostart prefers HTTP to HLS');
 assert(source.includes('items: ordered'), 'manual quality menu retains options');
+assert(source.includes('function bestHlsRendition(master)'), 'Atodo HLS picks explicit rendition');
+assert(source.includes("video._hlsVariantPinned"), 'HLS rendition selection does not recurse');
+assert(source.includes('BANDWIDTH='), 'HLS playlist bitrate is parsed for ranking');
 console.log('PASS: tv.js syntax, stable identities, restart resume, media events, settings, watched toggle, no signed URL persistence, opt-in providers');
