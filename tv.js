@@ -1,4 +1,4 @@
-// PluginLampa build 2026.10.23.4 · published TV distribution.
+// PluginLampa build 2026.10.23.5 · published TV distribution.
 // PluginLampa v0.6.5 · Archive + Rutube + Stremio + AniLiberty + KB.
 (function () {
   if (typeof window !== "undefined" && window.__lampa_video_finder_v1) return;
@@ -1281,7 +1281,7 @@ SOFTWARE.
   'use strict';
 
   if (window.__lampa_video_finder_v1) return;
-  var BUILD_ID='2026.10.23.4';
+  var BUILD_ID='2026.10.23.5';
   var UPDATE_URL='https://asarych.github.io/PluginLampa-public/tv.js';
   window.PluginLampaBuild=BUILD_ID;
   function checkBuildUpdate(done) {
@@ -1946,37 +1946,48 @@ SOFTWARE.
     });
     L.PlayerVideo.listener.follow('destroy', function () {pendingNativeTrackChoice = null;});
   }
-  // Opt-in diagnostic: never stringify playback objects, URL, currentSrc or errors.
-  // It observes the real Lampa video element without replacing player internals.
-  var atodoPictureReport = {text:'Ещё нет замера Atodo'};
-  // Native page is another IIFE: expose only a sanitized, URL-free diagnostic.
-  window.PluginLampaAtodoPicture = atodoPictureReport;
+  // Diagnostics use dimensions emitted by the decoded video, never labels.
+  // Do not stringify Lampa player objects or signed media URLs.
+  var atodoPictureReport={text:'Ещё нет замера Atodo'};
+  var atodoPictureContext=null;
+  window.PluginLampaAtodoPicture=atodoPictureReport;
+  function refreshAtodoPicture(e) {
+    var ctx=atodoPictureContext;
+    if(!ctx)return atodoPictureReport.text;
+    try {
+      var work=L.Player&&typeof L.Player.playdata==='function'?L.Player.playdata():null;
+      // Preserve the latest measured picture after the player closes.
+      if(!work||work._pluginlampaAtodoId!==ctx.id)return atodoPictureReport.text;
+      var label=String(work.quality_switched||ctx.declared).slice(0,24);
+      if(!work.quality_switched&&work.quality&&work.url){
+        Object.keys(work.quality).some(function(k){
+          if(work.quality[k]!==work.url)return false;
+          label=String(k).slice(0,24);return true;
+        });
+      }
+      var el=L.PlayerVideo&&typeof L.PlayerVideo.video==='function'?L.PlayerVideo.video():null;
+      var width=e&&Number(e.width)>0?Number(e.width):Number(el&&el.videoWidth);
+      var height=e&&Number(e.height)>0?Number(e.height):Number(el&&el.videoHeight);
+      if(!(width>0&&height>0&&width<=16384&&height<=16384))return atodoPictureReport.text;
+      var result='Atodo '+ctx.id+' · факт '+width+'×'+height+
+        ' · выбрано '+label+' · '+ctx.transport+' · битрейт недоступен';
+      if(atodoPictureReport.text!==result)atodoPictureReport.text=result;
+    }catch(_){}
+    return atodoPictureReport.text;
+  }
+  atodoPictureReport.refresh=function(){return refreshAtodoPicture();};
   function inspectAtodoPicture(provider,video) {
-    var declared=String(video&&video.quality||'неизвестно').slice(0,24);
-    var transport=String(video&&video.transport||'неизвестно').slice(0,24);
-    atodoPictureReport.text='Atodo '+provider.id+' · заявлено '+declared+' · '+transport+' · измерение...';
-    var started=Date.now();
-    function readPicture() {
-      try {
-        var el=L.PlayerVideo&&typeof L.PlayerVideo.video==='function'?L.PlayerVideo.video():null;
-        if(!el || !(Number(el.videoWidth)>0 && Number(el.videoHeight)>0)) {
-          if(Date.now()-started<15000)setTimeout(readPicture,2000);
-          else atodoPictureReport.text='Atodo · разрешение плеера недоступно; заявлено '+declared;
-          return;
-        }
-        var bitrate='битрейт недоступен';
-        try {
-          if(el.getVideoPlaybackQuality) {
-            var stat=el.getVideoPlaybackQuality();
-            if(stat&&Number.isFinite(stat.droppedVideoFrames))
-              bitrate='потеряно кадров '+stat.droppedVideoFrames+' (битрейт недоступен)';
-          }
-        }catch(_){}
-        atodoPictureReport.text='Atodo '+provider.id+' · '+el.videoWidth+'×'+el.videoHeight+
-          ' · заявлено '+declared+' · '+transport+' · '+bitrate;
-      }catch(_){atodoPictureReport.text='Atodo · замер не удался';}
-    }
-    setTimeout(readPicture,3000);
+    var ctx={id:provider.id,declared:String(video&&video.quality||'неизвестно').slice(0,24),
+      transport:String(video&&video.transport||'неизвестно').slice(0,24)};
+    atodoPictureContext=ctx;
+    atodoPictureReport.text='Atodo '+ctx.id+' · заявлено '+ctx.declared+
+      ' · '+ctx.transport+' · измерение...';
+    setTimeout(function(){if(atodoPictureContext===ctx)refreshAtodoPicture();},3000);
+  }
+  // Lampa emits 'videosize' after decoded frames and after quality switching.
+  if(L.PlayerVideo&&L.PlayerVideo.listener&&
+      typeof L.PlayerVideo.listener.follow==='function'){
+    L.PlayerVideo.listener.follow('videosize',function(e){refreshAtodoPicture(e);});
   }
   var atodoDiagnosticGeneration = 0;
   function atodoPlaybackDiagnostic(provider, transport, playback, mediaUrl) {
@@ -2119,12 +2130,13 @@ SOFTWARE.
     return Object.keys(mapped).length>1?mapped:null;
   }
   var activeProgressCleanup=null;
-  function progressWatch(movie) {
+  function progressWatch(movie,playback) {
     var id=progressId(movie);
     if(activeProgressCleanup){activeProgressCleanup();activeProgressCleanup=null;}
     if(!id)return;
-    var previous=progressItem(movie),started=Date.now(),active=true,attached=null,
-        lastWrite=0,mediaInitialized=false,cleanListeners=function(){};
+    var previous=progressItem(movie),active=true,attached=null,
+      lastWrite=0,mediaInitialized=false,cleanListeners=function(){};
+    var timer;
     function save(force){
       if(!active||!attached||!mediaInitialized)return;
       var t=Number(attached.currentTime),d=Number(attached.duration);
@@ -2140,29 +2152,35 @@ SOFTWARE.
       if(!active)return;
       save(true);
       active=false;clearInterval(timer);cleanListeners();
+      if(activeProgressCleanup===cleanup)activeProgressCleanup=null;
     }
     activeProgressCleanup=cleanup;
     function inspect(){
       if(!active)return;
-      if(Date.now()-started>120000){clearInterval(timer);return;}
+      // Lampa's native quality switch preserves playdata identity. Leaving
+      // that player ends this watcher without retaining any background timer.
+      if(mediaInitialized&&L.Player&&typeof L.Player.playdata==='function'&&
+          L.Player.playdata()!==playback){cleanup();return;}
       var el;
       try{el=L.PlayerVideo&&typeof L.PlayerVideo.video==='function'?
         L.PlayerVideo.video():null;}catch(_){return;}
       if(!el||el===attached||typeof el.addEventListener!=='function')return;
       cleanListeners();
       attached=el;
+      mediaInitialized=false;
       var resumed=false;
       function ready(){
         if(resumed||!active||el!==attached)return;
         resumed=true;
         mediaInitialized=true;
-        if(!progressPreferences().resume||!previous||previous.watched||
-           previous.position<20)return;
+        var initial=previous;
+        previous=null; // Only initial resume; quality switching uses native Timeline.
+        if(!progressPreferences().resume||!initial||initial.watched||
+           initial.position<20)return;
         var duration=Number(el.duration);
         if(!Number.isFinite(duration)||duration<30||
-           previous.position>=duration-20)return;
-        try{el.currentTime=previous.position;}catch(_){}
-        previous=null;
+           initial.position>=duration-20)return;
+        try{el.currentTime=initial.position;}catch(_){}
       }
       function tick(){save(false);}
       function pause(){save(true);}
@@ -2171,8 +2189,6 @@ SOFTWARE.
         if(!active||!mediaInitialized||!attached||!attached.ended||
            movie.media_type!=='tv'||!activeNativePage||
            typeof activeNativePage.playNextEpisode!=='function')return;
-        // Only the browser's actual ended event advances the series.
-        // Reaching the watched threshold or pressing Back never does.
         if(activeProgressCleanup===cleanup)
           activeNativePage.playNextEpisode(movie.card||{});
       }
@@ -2190,11 +2206,10 @@ SOFTWARE.
           el.removeEventListener('ended',ended);
         }catch(_){}
       };
-      // Do not seek using readyState of a reused element before the new
-      // playback's loadedmetadata event has identified its media.
-      clearInterval(timer);
+      // Keep checking: Lampa replaces HTMLVideoElement during a native
+      // quality switch, even though PluginLampa is not called again.
     }
-    var timer=setInterval(inspect,300);
+    timer=setInterval(inspect,800);
     inspect();
   }
   window.PluginLampaProgress={get:progressItem,progressId:progressId,mark:progressMark,settings:progressPreferences,setSettings:setProgressPreferences};
@@ -2301,11 +2316,12 @@ SOFTWARE.
         // Lampa's own Panel -> Player quality handler resets the video source
         // and calls Timeline.resetContinue(). A live timeline preserves position.
         playback.timeline={time:0,percent:0,duration:0};
+        playback._pluginlampaAtodoId=provider.id;
         atodoPlaybackDiagnostic(provider,transport,playback,stream);
       }
       L.Player.play(playback);
       if(atodo)inspectAtodoPicture(provider,video);
-      progressWatch(movie);
+      progressWatch(movie,playback);
       if (provider.id === 'collaps-direct' && L.Storage &&
           L.Storage.get('video_finder_hls_debug_v1',false) === true &&
           L.PlayerVideo && typeof L.PlayerVideo.video === 'function') {
@@ -4584,8 +4600,8 @@ if(E.registerAction)E.registerAction({id:'atodo-toggle',title:'⚙ Atodo · пл
       });
       control('Диагностика Atodo',function(){
         var report=window.PluginLampaAtodoPicture;
-        var message=report&&typeof report.text==='string'?
-          report.text:'Данные Atodo пока отсутствуют';
+        var message=report&&typeof report.refresh==='function'?report.refresh():
+          report&&typeof report.text==='string'?report.text:'Данные Atodo пока отсутствуют';
         if(L.Noty&&typeof L.Noty.show==='function')
           L.Noty.show(message,{time:10000});
       });
