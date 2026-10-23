@@ -2180,8 +2180,56 @@ SOFTWARE.
     inspect();
   }
   window.PluginLampaProgress={get:progressItem,progressId:progressId,mark:progressMark,settings:progressPreferences,setSettings:setProgressPreferences};
+  // Atodo AUTO may start at a 360p HLS variant even when higher variants exist.
+  // Resolve the master playlist to a concrete maximum BANDWIDTH rendition before play.
+  // Do not log, cache, or persist signed playlist URLs.
+  function bestHlsRendition(master) {
+    if(typeof fetch!=='function'||typeof URL!=='function')return Promise.resolve(null);
+    return fetch(master,{cache:'no-store'}).then(function(response){
+      if(!response.ok)throw Error('HLS master unavailable');
+      return response.text();
+    }).then(function(body){
+      if(typeof body!=='string'||body.length>1024*1024||body.indexOf('#EXTM3U')!==0)return null;
+      var lines=body.split(/\\r?\\n/),best=null;
+      for(var i=0;i<lines.length;i++){
+        var line=lines[i].trim();
+        if(line.indexOf('#EXT-X-STREAM-INF:')!==0)continue;
+        var info=line.slice(18),bit=/\\bBANDWIDTH=(\\d+)/.exec(info),
+          resolution=/\\bRESOLUTION=(\\d+)x(\\d+)/.exec(info);
+        var href='';
+        for(var j=i+1;j<lines.length;j++){
+          var next=lines[j].trim();
+          if(!next)continue;
+          if(next.charAt(0)!=='#')href=next;
+          break;
+        }
+        if(!href)continue;
+        var candidate='';
+        try{candidate=safePlaybackUrl(new URL(href,master).href);}catch(_){}
+        if(!candidate)continue;
+        var height=resolution?Number(resolution[2]):0,
+          bandwidth=bit?Number(bit[1]):0;
+        if(!best||height>best.height||(height===best.height&&bandwidth>best.bandwidth))
+          best={url:candidate,height:height,bandwidth:bandwidth};
+      }
+      return best;
+    }).catch(function(){return null;});
+  }
   function chooseStream(item, video, movie, provider) {
     var stream = safePlaybackUrl(video && video.url);
+    var isAtodo=provider.id==='atodo-jator'||provider.id==='atodo-xinu';
+    if(isAtodo&&video&&video.transport==='hls'&&!video._hlsVariantPinned&&stream){
+      bestHlsRendition(stream).then(function(best){
+        var selected=best?{
+          url:best.url,title:video.title,quality:best.height?best.height+'p':'HLS max',
+          transport:'hls',_hlsVariantPinned:true
+        }:{
+          url:stream,title:video.title,quality:'AUTO',transport:'hls',_hlsVariantPinned:true
+        };
+        chooseStream(item,selected,movie,provider);
+      });
+      return;
+    }
     if (!stream) {
       notify('Источник вернул неправильный URL', true);
       return;
