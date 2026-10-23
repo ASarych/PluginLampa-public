@@ -80,4 +80,7 @@ media.currentTime=1250;media.fire('pause');
 assert.equal(active.api.get(ep2).position,1250);
 media.currentTime=1660;media.fire('ended');
 assert.equal(active.api.get(ep2).watched,true);
+assert(source.includes('function bestAtodoHttpStream(streams)'), 'Atodo HTTP preference is implemented');
+assert(source.includes('bestAtodoHttpStream(streams)||highestQualityStream(streams)'), 'Atodo autostart prefers HTTP to HLS');
+assert(source.includes('items: ordered'), 'manual quality menu retains options');
 console.log('PASS: tv.js syntax, stable identities, restart resume, media events, settings, watched toggle, no signed URL persistence, opt-in providers');
